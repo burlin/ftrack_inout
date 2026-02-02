@@ -1,0 +1,73 @@
+templates:
+# Matching rules (component_name):
+# - component_name: exact string (case-insensitive). If contains * or ?, uses glob (fnmatch).
+# - component_name_prefix: prefix match (case-insensitive).
+# - component_name_suffix: suffix match (case-insensitive).
+# - component_name_regex: Python regex (case-insensitive).
+- name: rig_fbx
+  match:
+    asset_type: "Rig"
+    component_name: "rig"
+    file_format: "fbx"
+  node_type: "fbxcharacterimport"
+  generator: "create_rig_fbx_template"
+  key_file_parameter: "fbxfile"
+  subnet_color: [0.8, 0.5, 0.3]
+  post_process: ["delete_time_channel"]
+
+# Also treat components starting with SK_ as rig (FBX). Asset type is optional.
+- name: rig_fbx_sk_prefix
+  match:
+    component_name_prefix: "SK_"
+    file_format: "fbx"
+  node_type: "fbxcharacterimport"
+  generator: "create_rig_fbx_template"
+  key_file_parameter: "fbxfile"
+  subnet_color: [0.8, 0.5, 0.3]
+  post_process: ["delete_time_channel"]
+
+- name: anim_fbx
+  match:
+    asset_type: "Animation"
+    component_name: "anim"
+    file_format: "fbx"
+  node_type: "fbxanimimport"
+  generator: "create_anim_fbx_template"
+  key_file_parameter: "fbxfile"
+  subnet_color: [0.2, 0.5, 0.8]
+  post_process: []
+
+- name: animation_fbx
+  match:
+    asset_type: "Animation"
+    component_name: "animation"
+    file_format: "fbx"
+  node_type: "fbxanimimport"
+  generator: "create_anim_fbx_template"
+  key_file_parameter: "fbxfile"
+  subnet_color: [0.2, 0.5, 0.8]
+  post_process: [] 
+
+
+- name: animation_fbx
+  match:
+    asset_type: "Animation"
+    component_name: "animation_fbx"
+    file_format: "fbx"
+  node_type: "fbxanimimport"
+  generator: "create_anim_fbx_template"
+  key_file_parameter: "fbxfile"
+  subnet_color: [0.2, 0.5, 0.8]
+  post_process: [] 
+
+# Support *_anim suffix for animation templates
+- name: animation_fbx_suffix
+  match:
+    asset_type: "Animation"
+    component_name_suffix: "_anim"
+    file_format: "fbx"
+  node_type: "fbxanimimport"
+  generator: "create_anim_fbx_template"
+  key_file_parameter: "fbxfile"
+  subnet_color: [0.2, 0.5, 0.8]
+  post_process: []

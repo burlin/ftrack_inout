@@ -1,0 +1,50 @@
+# HDA parameters configuration for ftrack browser
+# Parameter names can be easily changed without modifying code
+
+hda_parameters:
+  # Parameters for Asset Version ID
+  asset_version_id:
+    - "assetversionid"      # primary variant (lowercase)
+    - "AssetVersionId"      # fallback (capitalized)
+    - "AssetVersion"        # alternative
+
+  # Parameters for Component Name
+  component_name:
+    - "componentname"       # primary variant (lowercase)
+    - "ComponentName"       # fallback (capitalized)
+
+  # Parameters for Component ID
+  component_id:
+    - "componentid"         # primary variant (lowercase)
+    - "ComponentId"         # fallback (capitalized)
+
+  # Parameters for Task ID
+  task_id:
+    - "task_Id"             # primary variant (as in current code)
+    - "taskid"              # alternative (lowercase)
+    - "TaskId"              # alternative (capitalized)
+    - "task_id"             # alternative (with underscore)
+
+  # Parameters for Asset ID
+  asset_id:
+    - "assetid"             # primary variant (lowercase)
+    - "AssetId"             # fallback (capitalized)
+    - "asset_id"            # alternative (with underscore)
+
+  # Parameters for Asset Name
+  asset_name:
+    - "assetname"           # primary variant (lowercase)
+    - "AssetName"           # fallback (capitalized)
+    - "asset_name"          # alternative (with underscore)
+
+  # Parameters for Asset Type
+  asset_type:
+    - "assettype"           # primary variant (lowercase)
+    - "AssetType"           # fallback (capitalized)
+    - "asset_type"          # alternative (with underscore)
+    - "type"                # short variant
+
+# Logging settings
+logging:
+  show_found_params: true   # show found parameters in logs
+  show_param_values: true   # show parameter values
