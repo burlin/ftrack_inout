@@ -16,7 +16,7 @@ Implemented:
 
 from __future__ import annotations
 
-from typing import Mapping, Any, Dict
+from typing import Mapping, Any, Dict, Sequence
 import logging
 import os
 import os.path
@@ -36,6 +36,8 @@ __all__ = [
     "MayaUserTasksHandlers",
     "open_ftrack_input_window",
     "create_input_node",
+    "set_hda_params_on_selected_nodes",
+    "set_full_params_on_publish_nodes",
 ]
 
 try:
@@ -45,6 +47,50 @@ except ImportError:
     create_input_node = None  # type: ignore[misc, assignment]
 
 _log = logging.getLogger(__name__)
+
+
+def set_hda_params_on_selected_nodes(
+    asset_version_id: str | None,
+    component_name: str | None,
+    component_id: str | None,
+    asset_id: str | None,
+    asset_name: str | None,
+    asset_type: str | None,
+    hda_param_config: Mapping[str, Sequence[str]],
+) -> tuple[int, int]:
+    """Maya stub: set params on selected nodes from browser selection.
+
+    Receives selected element params (e.g. component_id when component selected,
+    asset_version_id / asset_id / asset_name / asset_type when version or asset selected).
+    Returns (success_count, nodes_without_parms). Stub returns (0, 0) and logs params.
+    """
+    _log.info(
+        "[Maya Set Full Params] stub called with: asset_version_id=%s, component_name=%s, "
+        "component_id=%s, asset_id=%s, asset_name=%s, asset_type=%s",
+        asset_version_id,
+        component_name,
+        component_id,
+        asset_id,
+        asset_name,
+        asset_type,
+    )
+    return 0, 0
+
+
+def set_full_params_on_publish_nodes(
+    session: Any,
+    asset_id: str,
+    asset_name: str,
+    asset_type: str,
+) -> tuple[int, int]:
+    """Maya stub: no-op (publish-node logic is Houdini-specific). Returns (0, 0)."""
+    _log.debug(
+        "[Maya set_full_params_on_publish_nodes] stub: asset_id=%s, asset_name=%s, asset_type=%s",
+        asset_id,
+        asset_name,
+        asset_type,
+    )
+    return 0, 0
 
 
 def set_global_task_vars(task_id: str, task_label: str) -> None:

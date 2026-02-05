@@ -33,11 +33,29 @@ from .dcc.houdini import (
     HOUDINI_AVAILABLE,
     set_global_task_vars,
     set_task_id_on_selected_nodes,
-    set_hda_params_on_selected_nodes,
-    set_full_params_on_publish_nodes,
+    set_hda_params_on_selected_nodes as houdini_set_hda_params_on_selected_nodes,
+    set_full_params_on_publish_nodes as houdini_set_full_params_on_publish_nodes,
     load_snapshot_hip,
     apply_scene_setup,
 )
+
+try:
+    from .dcc.maya import (
+        MAYA_AVAILABLE,
+        set_hda_params_on_selected_nodes as maya_set_hda_params_on_selected_nodes,
+        set_full_params_on_publish_nodes as maya_set_full_params_on_publish_nodes,
+    )
+except ImportError:
+    MAYA_AVAILABLE = False
+    maya_set_hda_params_on_selected_nodes = None
+    maya_set_full_params_on_publish_nodes = None
+
+if MAYA_AVAILABLE and maya_set_hda_params_on_selected_nodes is not None:
+    set_hda_params_on_selected_nodes = maya_set_hda_params_on_selected_nodes
+    set_full_params_on_publish_nodes = maya_set_full_params_on_publish_nodes
+else:
+    set_hda_params_on_selected_nodes = houdini_set_hda_params_on_selected_nodes
+    set_full_params_on_publish_nodes = houdini_set_full_params_on_publish_nodes
 
 # Configure logging
 logging.basicConfig(
