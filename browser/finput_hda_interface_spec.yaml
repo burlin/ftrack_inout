@@ -1,0 +1,241 @@
+# finput HDA Interface Specification (burlin::finput::3.0)
+# Source: dump_hda_structure.py output from selected finput node.
+# Use this to align FtrackInputWidget / Maya adapter with the Houdini HDA UI.
+
+hda_type: "burlin::finput::3.0"
+description: "Full parameter structure of finput HDA for reference and Qt parity."
+
+parameters:
+  # --- Task block ---
+  - name: use_custom
+    label: "use custom"
+    type: Toggle
+
+  - name: sepparm5
+    type: Separator
+
+  - name: task_Id
+    label: task_Id
+    type: String
+    default: ""
+    callback: "hou.phm().checkTaskId()"
+    note: "Primary task context; check_taskid validates and loads assets."
+
+  - name: check_taskid
+    label: "check taskid"
+    type: Button
+    callback: "hou.phm().checkTaskId(**kwargs)"
+
+  - name: test
+    label: "Message"
+    type: Label
+    note: "Status/message for task block."
+
+  - name: apply_taskid_to_asset
+    label: "apply to asset"
+    type: Button
+    callback: "hou.phm().applyTaskId()"
+
+  - name: get_from_env
+    type: Button
+    callback: "hou.phm().get_from_env()"
+
+  - name: get_from_scene
+    type: Button
+    callback: "hou.phm().get_from_scene(**kwargs)"
+
+  - name: sepparm6
+    type: Separator
+
+  # --- Create / set asset block ---
+  - name: create_new
+    label: "cr_new"
+    type: Button
+    callback: "hou.phm().create_new()"
+
+  - name: get_ex_assets
+    label: "get_ex"
+    type: Button
+    callback: "hou.phm().initialize()"
+    note: "Load existing assets for task (uniVerList / get_data flow)."
+
+  - name: name_new
+    label: "New asset name"
+    type: String
+    default: ""
+
+  - name: create_asset
+    type: Button
+    callback: "hou.phm().createNewAsset()"
+
+  - name: set_this
+    type: Button
+    callback: "hou.phm().applyName()"
+
+  - name: sepparm11
+    type: Separator
+
+  # --- Asset identity (manual or from selection) ---
+  - name: asset_id
+    type: String
+    default: ""
+
+  - name: asset_name
+    type: String
+    default: ""
+    callback: "hou.phm().cleanAssetId()"
+
+  - name: type
+    label: type
+    type: String
+    default: "Animation"
+
+  - name: apply_params_to_asset
+    label: "apply to asset"
+    type: Button
+    callback: "hou.phm().applyLastAssetVersionFromAssetId(**kwargs)"
+
+  - name: sepparm7
+    type: Separator
+  - name: sepparm4
+    type: Separator
+
+  # --- Version / Component (populated by get_data / menus) ---
+  - name: AssetVersion
+    label: "Asset Version"
+    type: String
+    default: ""
+
+  - name: componentid
+    label: "Component Id"
+    type: String
+    default: ""
+
+  - name: subscribe_updates
+    label: "Subscribe to Updates"
+    type: Toggle
+    callback: "hou.phm().toggle_subscribe_updates(**kwargs)"
+
+  - name: ComponentName
+    label: "Component Name"
+    type: String
+    default: ""
+
+  - name: sepparm10
+    type: Separator
+
+  # --- Get data / Transfer ---
+  - name: get_data
+    label: "get from assetver"
+    type: Button
+    callback: "hou.phm().ftrack_hda.get_data(**kwargs)"
+    note: "Load versions/components for selected asset (populates menus)."
+
+  - name: transfer_to_local
+    type: Button
+    callback: "hou.phm().ftrack_hda.transferToLocal(**kwargs)"
+
+  - name: has_pending_update
+    label: "has pending update"
+    type: Toggle
+
+  - name: accept_update
+    label: "Accept Update"
+    type: Button
+    callback: "hou.phm().accept_update(**kwargs)"
+
+  - name: transfer_from_id
+    type: String
+    default: ""
+
+  - name: transfer_to_id
+    type: String
+    default: ""
+
+  - name: __ftrack_AssetVersion
+    type: String
+    default: ""
+
+  - name: __ftrack_used_CompId
+    type: String
+    default: ""
+
+  - name: transfer_ready
+    type: Toggle
+
+  - name: sepparm8
+    type: Separator
+
+  # --- Get from component / path ---
+  - name: get_fromcomp
+    label: "get from comp"
+    type: Button
+    callback: "hou.phm().ftrack_hda.get_fromcomp(**kwargs)"
+    note: "Resolve path and fill file_path / variables from selected component."
+
+  - name: log
+    label: "Message"
+    type: Label
+
+  - name: sepparm2
+    type: Separator
+
+  - name: file_path
+    label: "File Path"
+    type: String
+    default: ""
+
+  - name: sepparm
+    type: Separator
+
+  # --- Variables / metadata (Data parms) ---
+  - name: show_vars
+    label: "show variables"
+    type: Toggle
+
+  - name: metadict
+    type: Data
+
+  - name: variables
+    type: Data
+
+  - name: labelparm
+    label: "Message"
+    type: Label
+
+  - name: sepparm9
+    type: Separator
+  - name: sepparm3
+    type: Separator
+
+  # --- DCC actions ---
+  - name: create_node
+    label: "Create node"
+    type: Button
+    callback: "hou.phm().ftrack_hda.create_node(**kwargs)"
+    note: "Build Houdini node network from selected component (DCC-specific)."
+
+  - name: cleanUi
+    label: "clean ui"
+    type: Button
+    callback: "hou.phm().ftrack_hda.restore_interface(**kwargs)"
+
+  - name: child_ui
+    type: Separator
+
+# Mapping: FtrackInputWidget -> HDA params
+# (for implementing Apply / Transfer and syncing with HDA or Maya node)
+widget_to_hda_mapping:
+  task_id:           task_Id
+  load_assets_btn:   check_taskid  # or get_ex_assets after task set
+  asset_combo:      asset_id / asset_name (from menu selection)
+  version_combo:     AssetVersion (from get_data menus)
+  component_combo:   componentid, ComponentName (from get_data menus)
+  apply_btn:         get_fromcomp  # resolve path, fill file_path/variables
+  transfer_btn:      transfer_to_local
+  file_path:         file_path
+  transfer_ready:   transfer_ready
+  transfer_from_id: transfer_from_id
+  transfer_to_id:   transfer_to_id
+  variables:        variables
+  metadata:         metadict

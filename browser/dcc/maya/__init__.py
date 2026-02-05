@@ -9,7 +9,9 @@ Implemented:
 - set_global_task_vars: set FTRACK_CONTEXTID / FTRACK_TASK;
 - apply_scene_setup: basic FPS + frame range from shot data;
 - MayaUserTasksHandlers: UserTasksWidget button handlers
-  (Create Task Scene / Open Scene) with behavior similar to Houdini.
+  (Create Task Scene / Open Scene) with behavior similar to Houdini;
+- open_ftrack_input_window: Ftrack Input (finput-like) window for Maya;
+- create_input_node: create mroya_input locator with component attributes (from maya_input_window).
 """
 
 from __future__ import annotations
@@ -32,7 +34,15 @@ __all__ = [
     "set_global_task_vars",
     "apply_scene_setup",
     "MayaUserTasksHandlers",
+    "open_ftrack_input_window",
+    "create_input_node",
 ]
+
+try:
+    from .maya_input_window import open_ftrack_input_window, create_input_node
+except ImportError:
+    open_ftrack_input_window = None  # type: ignore[misc, assignment]
+    create_input_node = None  # type: ignore[misc, assignment]
 
 _log = logging.getLogger(__name__)
 

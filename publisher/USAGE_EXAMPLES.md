@@ -1,4 +1,7 @@
 
+
+
+
 ## 2. Custom Component Types
 
 You can inherit from `ComponentData` or create specialized classes:

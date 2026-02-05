@@ -821,8 +821,94 @@ class FtrackApiClient:
             logger.error(f"Failed to get versions for asset {asset_id}: {e}")
             return []
 
+    def get_versions_for_asset_and_task(self, asset_id, task_id):
+        """Get AssetVersions for an asset linked to a specific task (finput-style)."""
+        if not self.session:
+            return []
+        try:
+            query = (
+                f'select id, version, comment, date, user.first_name from AssetVersion '
+                f'where asset.id is "{asset_id}" and task.id is "{task_id}" order by version desc'
+            )
+            versions_raw = self.session.query(query).all()
+            versions = []
+            for version_raw in versions_raw:
+                user_data = version_raw.get('user')
+                user_first_name = 'Unknown'
+                if user_data:
+                    if isinstance(user_data, dict):
+                        user_first_name = user_data.get('first_name', 'Unknown')
+                    else:
+                        try:
+                            user_first_name = user_data.get('first_name', 'Unknown')
+                        except Exception:
+                            user_first_name = 'Unknown'
+                version_data = {
+                    'id': version_raw['id'],
+                    'version': version_raw['version'],
+                    'comment': version_raw.get('comment', ''),
+                    'date': version_raw.get('date'),
+                    'user': {'first_name': user_first_name},
+                    'asset': {'id': asset_id},
+                }
+                versions.append(version_data)
+            return versions
+        except Exception as e:
+            logger.error(f"Failed to get versions for asset {asset_id} task {task_id}: {e}")
+            return []
+
+    def get_assets_for_task(self, task_id):
+        """Get unique assets that have at least one AssetVersion linked to this task."""
+        if not self.session:
+            return []
+        try:
+            query = f'select asset_id from AssetVersion where task.id is "{task_id}"'
+            version_results = self.session.query(query).all()
+            if not version_results:
+                return []
+            asset_ids = {v['asset_id'] for v in version_results if v.get('asset_id')}
+            if not asset_ids:
+                return []
+            asset_entities = []
+            for asset_id in asset_ids:
+                try:
+                    asset = self.session.get('Asset', asset_id)
+                    if not asset:
+                        try:
+                            asset = self.session.get('AssetBuild', asset_id)
+                        except Exception:
+                            pass
+                    if asset:
+                        asset_entities.append(asset)
+                except Exception as e:
+                    logger.debug("Asset %s not found as Asset/AssetBuild: %s", asset_id, e)
+            return sorted(asset_entities, key=lambda x: (x.get('name') or '').lower())
+        except Exception as e:
+            logger.error("Failed to get assets for task %s: %s", task_id, e)
+            return []
+
+    def get_components_for_version(self, version_id):
+        """Get list of components for a version (id, name, file_type) without resolving paths. Fast for combo population."""
+        if not self.session:
+            return []
+        try:
+            query = f'select id, name, file_type from Component where version.id is "{version_id}"'
+            components_data = self.session.query(query).all()
+            return [
+                {
+                    'id': c['id'],
+                    'name': c.get('name', ''),
+                    'file_type': c.get('file_type', ''),
+                    'display_name': f"{c.get('name', '')} ({c.get('file_type', '')})" if c.get('file_type') else (c.get('name') or ''),
+                }
+                for c in components_data
+            ]
+        except Exception as e:
+            logger.error("get_components_for_version failed: %s", e)
+            return []
+
     def get_components_with_paths_for_version(self, version_id):
-        """Get all components with file paths for a version"""
+        """Get all components with file paths for a version (slower: resolves path for each)."""
         if not self.session:
             return []
             
@@ -865,6 +951,143 @@ class FtrackApiClient:
                 'path': path
             })
         return processed_components
+
+    def get_component_by_version_and_name(self, version_id, component_name):
+        """
+        Resolve component id from Asset Version id + Component Name (finput flow).
+        Copy version id and component name from web/browser → get component id + path.
+        Returns dict with id, name, file_type or None if not found.
+        """
+        if not self.session or not version_id or not component_name:
+            return None
+        component_name = (component_name or "").strip()
+        if not component_name:
+            return None
+        try:
+            # Try exact name match first (ftrack query: name is "value")
+            query = (
+                f'select id, name, file_type from Component '
+                f'where version.id is "{version_id}" and name is "{component_name}"'
+            )
+            comp = self.session.query(query).first()
+            if comp:
+                return {'id': comp['id'], 'name': comp.get('name', ''), 'file_type': comp.get('file_type', '')}
+            # Fallback: get all components for version, filter by name in Python
+            all_comps = self.session.query(
+                f'select id, name, file_type from Component where version.id is "{version_id}"'
+            ).all()
+            for c in all_comps:
+                if (c.get('name') or '').strip().lower() == component_name.strip().lower():
+                    return {'id': c['id'], 'name': c.get('name', ''), 'file_type': c.get('file_type', '')}
+            return None
+        except Exception as e:
+            logger.warning("get_component_by_version_and_name failed: %s", e)
+            return None
+
+    def get_component_info(self, component_id):
+        """
+        Resolve version_id, component_name, asset from Component Id (get_fromcomp style).
+        Component Id has priority: use this to fill Asset Version and Component Name.
+        Returns dict with version_id, component_name, asset_id, asset_name, asset_type or None.
+        """
+        if not self.session or not component_id:
+            return None
+        try:
+            comp = self.session.get('Component', component_id)
+            if not comp:
+                return None
+            version = comp.get('version')
+            if not version:
+                return None
+            version_id = version.get('id')
+            component_name = comp.get('name', '')
+            asset_ent = version.get('asset')
+            asset_id = asset_ent.get('id') if asset_ent else None
+            asset_name = asset_ent.get('name', '') if asset_ent else ''
+            asset_type = ''
+            if asset_ent and asset_ent.get('type'):
+                t = asset_ent.get('type')
+                asset_type = t.get('name', '') if hasattr(t, 'get') else str(t)
+            return {
+                'component_id': comp['id'],
+                'component_name': component_name,
+                'version_id': version_id,
+                'version_number': version.get('version'),
+                'asset_id': asset_id,
+                'asset_name': asset_name,
+                'asset_type': asset_type,
+            }
+        except Exception as e:
+            logger.warning("get_component_info failed: %s", e)
+            return None
+
+    def get_component_location_info(self, component_id):
+        """
+        Resolve path and availability for a component at the picked location.
+        Returns dict: path, availability (0-100), location_id, location_name, transfer_ready.
+        """
+        if not self.session or not component_id:
+            return {
+                'path': '',
+                'availability': 0.0,
+                'location_id': None,
+                'location_name': None,
+                'transfer_ready': True,
+            }
+        try:
+            component = self.session.get('Component', component_id)
+            if not component:
+                return {
+                    'path': '',
+                    'availability': 0.0,
+                    'location_id': None,
+                    'location_name': None,
+                    'transfer_ready': True,
+                }
+            # Ensure version is loaded so location can resolve path (some plugins need it)
+            try:
+                component.get('version')
+            except Exception:
+                pass
+            location = self.session.pick_location()
+            if not location:
+                return {
+                    'path': '',
+                    'availability': 0.0,
+                    'location_id': None,
+                    'location_name': None,
+                    'transfer_ready': True,
+                }
+            availability = location.get_component_availability(component)
+            path = location.get_filesystem_path(component)
+            if path is None:
+                path = ''
+            path = (path or '').strip()
+            # Normalize backslashes for display
+            if path and '\\' in path:
+                path = path.replace('\\', '/')
+            if not path and availability and float(availability) >= 100.0:
+                logger.warning(
+                    "get_component_location_info: path empty but availability=%.0f%% for component %s at %s",
+                    float(availability), component_id, location.get('name'),
+                )
+            transfer_ready = availability < 100.0 or not path or path.startswith('N/A')
+            return {
+                'path': path,
+                'availability': float(availability),
+                'location_id': location.get('id'),
+                'location_name': location.get('name'),
+                'transfer_ready': transfer_ready,
+            }
+        except Exception as e:
+            logger.warning("get_component_location_info failed for %s: %s", component_id, e)
+            return {
+                'path': '',
+                'availability': 0.0,
+                'location_id': None,
+                'location_name': None,
+                'transfer_ready': True,
+            }
 
     def get_shot_custom_attributes_on_demand(self, shot_id):
         """Fetch shot custom attributes on-demand when needed for metadata display"""
