@@ -46,35 +46,12 @@ except ImportError:
     open_ftrack_input_window = None  # type: ignore[misc, assignment]
     create_input_node = None  # type: ignore[misc, assignment]
 
+try:
+    from .maya_node_params import set_hda_params_on_selected_nodes
+except ImportError:
+    set_hda_params_on_selected_nodes = None  # type: ignore[misc, assignment]
+
 _log = logging.getLogger(__name__)
-
-
-def set_hda_params_on_selected_nodes(
-    asset_version_id: str | None,
-    component_name: str | None,
-    component_id: str | None,
-    asset_id: str | None,
-    asset_name: str | None,
-    asset_type: str | None,
-    hda_param_config: Mapping[str, Sequence[str]],
-) -> tuple[int, int]:
-    """Maya stub: set params on selected nodes from browser selection.
-
-    Receives selected element params (e.g. component_id when component selected,
-    asset_version_id / asset_id / asset_name / asset_type when version or asset selected).
-    Returns (success_count, nodes_without_parms). Stub returns (0, 0) and logs params.
-    """
-    _log.info(
-        "[Maya Set Full Params] stub called with: asset_version_id=%s, component_name=%s, "
-        "component_id=%s, asset_id=%s, asset_name=%s, asset_type=%s",
-        asset_version_id,
-        component_name,
-        component_id,
-        asset_id,
-        asset_name,
-        asset_type,
-    )
-    return 0, 0
 
 
 def set_full_params_on_publish_nodes(
