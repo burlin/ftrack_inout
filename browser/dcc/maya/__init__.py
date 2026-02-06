@@ -46,10 +46,10 @@ except ImportError:
     open_ftrack_input_window = None  # type: ignore[misc, assignment]
     create_input_node = None  # type: ignore[misc, assignment]
 
-# Import from mroya_maya_utils (located in ftrack-framework-maya bootstrap folder)
+# Import from mroya.maya (located in ftrack-framework-maya extensions folder)
 # This module is available when running inside Maya via ftrack Connect
 try:
-    from mroya_maya_utils import set_hda_params_on_selected_nodes
+    from mroya.maya import set_hda_params_on_selected_nodes
 except ImportError:
     set_hda_params_on_selected_nodes = None  # type: ignore[misc, assignment]
 
