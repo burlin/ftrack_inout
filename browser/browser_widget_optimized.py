@@ -40,6 +40,36 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+
+def _is_sequence_path(path):
+    """Check if path contains sequence pattern (%04d, %d, $F, @, #, etc)."""
+    if not path or not isinstance(path, str) or path.startswith("N/A"):
+        return False
+    import re
+    indicators = ['%d', '%0', '$F', '@', '#{']
+    for ind in indicators:
+        if ind in path:
+            return True
+    if '#' in path and re.search(r'[._]#+[._]', path):
+        return True
+    return False
+
+
+def _build_component_display_name(comp_name, file_type, path):
+    """Build display name: for sequences show pattern (e.g. .%04d.sc), for single files show file_type."""
+    if not comp_name:
+        comp_name = 'Unknown'
+    if _is_sequence_path(path):
+        basename = os.path.basename(path)
+        if basename.startswith(comp_name):
+            suffix = basename[len(comp_name):]
+            if suffix.startswith('.'):
+                return f"{comp_name} ({suffix})"
+    if file_type:
+        return f"{comp_name} ({file_type})"
+    return comp_name
+
+
 # Import our optimized components
 try:
     from .simple_api_client import SimpleFtrackApiClient
@@ -607,12 +637,17 @@ class OptimizedFtrackApiClient:
             if not self.session:
                 return []
             
+            # Invalidate cache when force_refresh so we don't return stale data
+            if force_refresh and version_id in self._version_components_cache:
+                del self._version_components_cache[version_id]
+                logger.info(f"[CACHE INVALIDATE] Cleared cache for version {version_id} (force_refresh)")
+            
             # Check cache first (unless force_refresh)
             if not force_refresh:
                 cache_size = len(self._version_components_cache)
                 if version_id in self._version_components_cache:
                     cached_components = self._version_components_cache[version_id]
-                    logger.info(f"[CACHE HIT] Using cached components for version {version_id} ({len(cached_components)} components, cache size: {cache_size})")
+                    logger.info(f"[CACHE HIT] Components for version {version_id} ({len(cached_components)} items) - 0ms @ {time.strftime('%H:%M:%S', time.localtime())}")
                     return cached_components
                 else:
                     logger.info(f"[CACHE MISS] Version {version_id} not in cache (cache size: {cache_size}, keys: {list(self._version_components_cache.keys())[:3] if cache_size > 0 else 'empty'}...)")
@@ -705,11 +740,8 @@ class OptimizedFtrackApiClient:
                     comp_name = component.get('name', '')
                     file_type = component.get('file_type', '')
                     
-                    # Create display_name as in the original
-                    if file_type:
-                        display_name = f"{comp_name} ({file_type})"
-                    else:
-                        display_name = comp_name
+                    # For sequences: show pattern (e.g. maya_part (.%04d.sc)); for single files: maya_part (.sc)
+                    display_name = _build_component_display_name(comp_name, file_type, path)
 
                     # Collect location names where component is available (fresh from populate if force_refresh)
                     locations = []
@@ -735,15 +767,15 @@ class OptimizedFtrackApiClient:
             batch_time = time.time() - batch_start
             total_time = time.time() - start_time
             
-            logger.info(f"[OK] OPTIMIZED: {len(result)} components with paths loaded in {total_time:.3f}s")
-            logger.info(f"   [STATS] Query: {query_time:.3f}s, Batch get: {batch_time:.3f}s")
+            logger.info(f"[OK] OPTIMIZED: {len(result)} components with paths loaded in {total_time:.3f}s @ {time.strftime('%H:%M:%S', time.localtime())} (force_refresh={force_refresh})")
+            logger.info(f"   [STATS] Query: {query_time:.3f}s, Batch get: {batch_time:.3f}s, Total: {total_time*1000:.0f}ms")
             logger.info(f"   [LAUNCH] Speed: {len(result)/total_time:.1f} components/sec")
             
-            # Cache result for future use
-            if not force_refresh and result:
+            # Cache result for future use (including force_refresh - keep cache current)
+            if result:
                 try:
                     self._version_components_cache[version_id] = result
-                    logger.info(f"[CACHE SAVE] Saved {len(result)} components for version {version_id} to cache (cache size now: {len(self._version_components_cache)})")
+                    logger.info(f"[CACHE SAVE] Saved {len(result)} components for version {version_id} to cache (force_refresh={force_refresh})")
                 except Exception as cache_error:
                     logger.warning(f"[CACHE SAVE ERROR] Failed to save to cache: {cache_error}")
             
@@ -1065,7 +1097,7 @@ class OptimizedFtrackApiClient:
             # Check cache first (unless force_refresh)
             if not force_refresh and hasattr(self, '_asset_versions_cache') and asset_id in self._asset_versions_cache:
                 cached_versions = self._asset_versions_cache[asset_id]
-                logger.info(f"[CACHE HIT] Using cached versions for asset {asset_id} ({len(cached_versions)} versions)")
+                logger.info(f"[CACHE HIT] Versions for asset {asset_id} ({len(cached_versions)} versions) - 0ms @ {time.strftime('%H:%M:%S', time.localtime())}")
                 return cached_versions
             
             logger.info(f"[LAUNCH] OPTIMIZED: Fetching versions for asset {asset_id} (force_refresh={force_refresh})")
@@ -1222,7 +1254,14 @@ class OptimizedFtrackApiClient:
             step2_time = step2_end - step2_start
             total_time = time.time() - start_time
             
-            logger.info(f"[OK] OPTIMIZED: {len(result)} versions loaded in {total_time:.3f}s")
+            # Always update cache - critical: refresh must persist, next calls get fresh data
+            if result:
+                cache_save_start = time.time()
+                self._asset_versions_cache[asset_id] = result
+                cache_save_ms = (time.time() - cache_save_start) * 1000
+                logger.info(f"[CACHE SAVE] Saved {len(result)} versions for asset {asset_id} in {cache_save_ms:.1f}ms (force_refresh={force_refresh})")
+            
+            logger.info(f"[OK] OPTIMIZED: {len(result)} versions loaded in {total_time:.3f}s @ {time.strftime('%H:%M:%S', time.localtime())}")
             logger.info(f"   [STATS] Query: {query_time:.3f}s, Batch get: {batch_get_time:.3f}s, Populate: {populate_time*1000:.1f}ms, Conversion: {conversion_time*1000:.1f}ms")
             logger.info(f"   [TIMING] Step 1: {step1_time*1000:.1f}ms, Step 2: {step2_time*1000:.1f}ms, Total: {total_time*1000:.1f}ms")
             if cached_count > 0:

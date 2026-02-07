@@ -141,6 +141,35 @@ FTRACK_PLUGINS_ROOT = FTRACK_INOUT_ROOT.parent
 MULTI_SITE_PLUGIN_PATH = FTRACK_PLUGINS_ROOT / "multi-site-location-0.2.0"
 
 
+def _is_sequence_path(path: str) -> bool:
+    """Check if path contains sequence pattern (%04d, %d, $F, @, #, etc)."""
+    if not path or not isinstance(path, str) or path.startswith("N/A"):
+        return False
+    import re
+    indicators = ['%d', '%0', '$F', '@', '#{']
+    for ind in indicators:
+        if ind in path:
+            return True
+    if '#' in path and re.search(r'[._]#+[._]', path):
+        return True
+    return False
+
+
+def _build_component_display_name(comp_name: str, file_type: str, path: str) -> str:
+    """Build display name: for sequences show pattern (e.g. .%04d.sc), for single files show file_type."""
+    if not comp_name:
+        comp_name = 'Unknown'
+    if _is_sequence_path(path):
+        basename = os.path.basename(path)
+        if basename.startswith(comp_name):
+            suffix = basename[len(comp_name):]
+            if suffix.startswith('.'):
+                return f"{comp_name} ({suffix})"
+    if file_type:
+        return f"{comp_name} ({file_type})"
+    return comp_name
+
+
 def _add_locations_if_available(session: "ftrack_api.Session") -> None:
     """Register S3 / user locations if multi-site plugin is available.
 
@@ -938,10 +967,7 @@ class FtrackApiClient:
             
             comp_name = comp.get('name', 'Unknown Component')
             file_type = comp.get('file_type', '')
-            if file_type:
-                display_name = f"{comp_name} ({file_type})"
-            else:
-                display_name = comp_name
+            display_name = _build_component_display_name(comp_name, file_type, path or '')
             
             processed_components.append({
                 'id': comp['id'],

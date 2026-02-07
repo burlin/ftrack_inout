@@ -575,8 +575,8 @@ if PYSIDE6_AVAILABLE:
             
             refresh_end_time = time_module.time()
             total_refresh_time = refresh_end_time - refresh_click_time
-            logger.info(f"[REFRESH CLICK] Refresh completed at {time_module.strftime('%H:%M:%S', time_module.localtime(refresh_end_time))}.{int((refresh_end_time % 1) * 1000):03d}")
-            logger.info(f"[REFRESH CLICK] Total refresh time: {total_refresh_time:.3f}s ({total_refresh_time*1000:.1f}ms)")
+            logger.info(f"[REFRESH CLICK] Completed at {time_module.strftime('%H:%M:%S', time_module.localtime(refresh_end_time))}.{int((refresh_end_time % 1) * 1000):03d}")
+            logger.info(f"[REFRESH CLICK] TOTAL COST: {total_refresh_time:.3f}s ({total_refresh_time*1000:.0f}ms) - sync part only (QTimer callbacks run later)")
 
         def _get_path_from_component_to_project(self, session, component_id):
             """Resolve component -> version -> asset -> parent chain to project (uses session cache).
@@ -1334,12 +1334,13 @@ if PYSIDE6_AVAILABLE:
                 asset_item.takeChildren()
 
                 # Get versions for this specific asset, filtered by task if applicable
-                # get_versions_for_asset will use cache if available
+                # force_refresh=True: always use query to get fresh version list from server,
+                # avoids stale ftrack relationship cache after browser reload
                 if self.current_task_filter_id:
                     logger.info(f"[SEARCH] Filtering versions for asset {asset_id} by task {self.current_task_filter_id}")
                     versions = self.api.get_versions_for_asset_and_task(asset_id, self.current_task_filter_id)
                 else:
-                    versions = self.api.get_versions_for_asset(asset_id)
+                    versions = self.api.get_versions_for_asset(asset_id, force_refresh=True)
                 
                 if not versions:
                     no_versions_item = QtWidgets.QTreeWidgetItem(["No versions found"])
@@ -1410,8 +1411,15 @@ if PYSIDE6_AVAILABLE:
             if current_item:
                 self.on_asset_version_selected(current_item, 0)
 
-        def on_asset_version_selected(self, item, column):
-            """Handle asset version selection"""
+        def on_asset_version_selected(self, item, column, force_refresh_components=False):
+            """Handle asset version selection
+
+            Args:
+                item: Selected tree item
+                column: Column index (unused)
+                force_refresh_components: If True, refresh component_locations to get fresh paths
+                    (e.g., after transfer). Used when restoring selection after refresh.
+            """
             try:
                 item_type = item.data(0, ASSET_VERSION_ITEM_TYPE_ROLE)
                 version_id = item.data(0, ASSET_VERSION_ITEM_ID_ROLE)
@@ -1424,8 +1432,8 @@ if PYSIDE6_AVAILABLE:
                     self.right_pane_selected_id_label.setText("N/A")
 
                 if item_type == 'AssetVersion' and version_id:
-                    logger.info(f"AssetVersion selected: ID {version_id}. Loading components...")
-                    self.load_components_for_version(version_id)
+                    logger.info(f"AssetVersion selected: ID {version_id}. Loading components... (force_refresh={force_refresh_components})")
+                    self.load_components_for_version(version_id, force_refresh=force_refresh_components)
                     
                     # Update metadata display for AssetVersion
                     asset_version_data = {
@@ -1473,8 +1481,10 @@ if PYSIDE6_AVAILABLE:
             components_start_time = time_module.time()
             
             try:
-                logger.info(f"[COMPONENTS] Loading components for version {version_id[:8] if version_id else 'N/A'}... (force_refresh={force_refresh}) at {time_module.strftime('%H:%M:%S', time_module.localtime(components_start_time))}.{int((components_start_time % 1) * 1000):03d}")
+                logger.info(f"[COMPONENTS] Loading for version {version_id[:8] if version_id else 'N/A'}... force_refresh={force_refresh} @ {time_module.strftime('%H:%M:%S', time_module.localtime(components_start_time))}")
+                api_start = time_module.time()
                 components = self.api.get_components_with_paths_for_version(version_id, force_refresh=force_refresh)
+                api_ms = (time_module.time() - api_start) * 1000
                 if not components:
                     self.component_list.addItem("No components found.")
                     self.update_status("No components for selected version.")
@@ -1503,8 +1513,7 @@ if PYSIDE6_AVAILABLE:
                 components_time = components_end_time - components_start_time
                 
                 self.update_status(f"Components loaded for version ID: {version_id}")
-                logger.info(f"[COMPONENTS] Components loaded for version {version_id[:8] if version_id else 'N/A'}... at {time_module.strftime('%H:%M:%S', time_module.localtime(components_end_time))}.{int((components_end_time % 1) * 1000):03d}")
-                logger.info(f"[COMPONENTS] Total time: {components_time:.3f}s ({components_time*1000:.1f}ms) for {len(components)} components")
+                logger.info(f"[COMPONENTS] Loaded {len(components)} components in {components_time*1000:.0f}ms (API: {api_ms:.0f}ms, force_refresh={force_refresh}) @ {time_module.strftime('%H:%M:%S', time_module.localtime(components_end_time))}")
 
                 # Automatically set "From" location
                 comp_locations = stored_data.get('locations', [])
@@ -2194,6 +2203,7 @@ if PYSIDE6_AVAILABLE:
                 logger.info(f"[UI STATE] isExpanded() took {(time_module.time() - t1)*1000:.1f}ms")
                 
                 selected_asset_version_id = None
+                had_components_loaded = False  # True if component_list had items (need force_refresh on restore)
                 
                 # Check if any version under this asset is currently selected
                 t2 = time_module.time()
@@ -2203,6 +2213,7 @@ if PYSIDE6_AVAILABLE:
                 t3 = time_module.time()
                 if current_version_item and current_version_item.parent() == asset_item:
                     selected_asset_version_id = current_version_item.data(0, ASSET_VERSION_ITEM_ID_ROLE)
+                    had_components_loaded = self.component_list.count() > 0
                 logger.info(f"[UI STATE] parent check + data() took {(time_module.time() - t3)*1000:.1f}ms")
                 
                 # Remove all version children from this asset
@@ -2236,39 +2247,36 @@ if PYSIDE6_AVAILABLE:
                 refresh_start = refresh_start_time if refresh_start_time else time_module.time()
                 api_call_start = time_module.time()
                 
-                # If a specific version is selected, refresh only that version (much faster)
-                # NOTE: We refresh version metadata (date, comment) and component_locations if components are loaded.
+                # If a specific version was selected, refresh only that version (much faster)
+                # NOTE: Use selected_asset_version_id saved BEFORE takeChild() - after removing children,
+                # currentItem()/parent() is invalid so we would never enter this block and miss
+                # component_locations refresh (paths would not update after transfer).
                 # Component_locations may change after transfer, so we refresh paths for already-loaded components.
-                current_version_item = self.asset_version_tree.currentItem()
                 single_version_refresh = False
-                if current_version_item and current_version_item.parent() == asset_item:
-                    current_version_id = current_version_item.data(0, ASSET_VERSION_ITEM_ID_ROLE)
-                    if current_version_id:
-                        # Refresh only the selected version (optimization - ~30x faster)
-                        logger.info(f"[OPTIMIZATION] Refreshing only selected version {current_version_id} instead of all versions")
-                        refreshed_version = self.api.refresh_single_version(current_version_id)
-                        if refreshed_version:
-                            single_version_refresh = True
-                            # Get all versions from cache (fast)
-                            versions = self.api.get_versions_for_asset(asset_id, force_refresh=False)
-                            # Replace the refreshed version in the list
-                            for i, v in enumerate(versions):
-                                if v['id'] == current_version_id:
-                                    versions[i] = refreshed_version
-                                    break
-                            
-                            # If components are already loaded for this version, refresh only component_locations (paths)
-                            # This is needed because paths may change after transfer to accessible location
-                            if self.component_list.count() > 0:
-                                logger.info(f"[REFRESH] Refreshing component_locations for selected version {current_version_id}")
-                                QtCore.QTimer.singleShot(200, lambda: self.load_components_for_version(current_version_id, force_refresh=True))
-                            # NOTE: If components are not loaded yet, they will be loaded on version selection
-                        else:
-                            # Fallback: refresh all versions
-                            logger.warning(f"Single version refresh failed, falling back to full refresh")
-                            versions = self.api.get_versions_for_asset(asset_id, force_refresh=True)
+                current_version_id = selected_asset_version_id
+                if current_version_id:
+                    # Refresh only the selected version (optimization - ~30x faster)
+                    logger.info(f"[OPTIMIZATION] Refreshing only selected version {current_version_id} instead of all versions")
+                    refreshed_version = self.api.refresh_single_version(current_version_id)
+                    if refreshed_version:
+                        single_version_refresh = True
+                        # Get versions with force_refresh=True - must not use cache here,
+                        # otherwise list "rolls back" (relationship/cache can be stale,
+                        # missing new versions). Refresh button must show current state.
+                        versions = self.api.get_versions_for_asset(asset_id, force_refresh=True)
+                        # Replace the refreshed version in the list (redundant with force_refresh
+                        # but keeps refreshed_version in case populate missed something)
+                        for i, v in enumerate(versions):
+                            if v['id'] == current_version_id:
+                                versions[i] = refreshed_version
+                                break
+                        
+                        # NOTE: If components were loaded, force_refresh_components is passed to
+                        # _restore_asset_version_selection so on_asset_version_selected loads
+                        # with force_refresh=True (fresh component_locations after transfer)
                     else:
-                        # No version ID, refresh all
+                        # Fallback: refresh all versions
+                        logger.warning(f"Single version refresh failed, falling back to full refresh")
                         versions = self.api.get_versions_for_asset(asset_id, force_refresh=True)
                 else:
                     # No version selected, refresh all versions (to see new versions)
@@ -2335,16 +2343,18 @@ if PYSIDE6_AVAILABLE:
                 total_refresh_time = time_module.time() - refresh_start
                 logger.info(f"[REFRESH TIMING] UI repopulation took {ui_time:.3f}s, total refresh: {total_refresh_time:.3f}s")
                 
-                # Restore version selection if needed
+                # Restore version selection if needed (force_refresh_components when we had
+                # components loaded - to get fresh paths/locations after transfer)
                 if selected_asset_version_id:
-                    QtCore.QTimer.singleShot(50, lambda: self._restore_asset_version_selection(asset_item, selected_asset_version_id))
+                    QtCore.QTimer.singleShot(50, lambda: self._restore_asset_version_selection(
+                        asset_item, selected_asset_version_id, force_refresh_components=had_components_loaded))
                 
                 refresh_end_time = time_module.time()
                 total_refresh_time = refresh_end_time - refresh_start_time
                 
                 self.update_status(f"Refreshed versions for asset '{asset_name}'")
                 logger.info(f"[REFRESH ASSET] Asset versions refresh completed for '{asset_name}' at {time_module.strftime('%H:%M:%S', time_module.localtime(refresh_end_time))}.{int((refresh_end_time % 1) * 1000):03d}")
-                logger.info(f"[REFRESH ASSET] Total time: {total_refresh_time:.3f}s ({total_refresh_time*1000:.1f}ms)")
+                logger.info(f"[REFRESH ASSET] TOTAL: {total_refresh_time:.3f}s ({total_refresh_time*1000:.0f}ms) | cache_clear: {step_times.get('cache_clear', 0)*1000:.0f}ms, metadata: {step_times.get('metadata_refresh', 0)*1000:.0f}ms, ui_state: {step_times.get('ui_state', 0)*1000:.0f}ms, api: {step_times.get('api_call', 0)*1000:.0f}ms, ui_repop: {ui_time*1000:.0f}ms")
                 
             except Exception as e:
                 refresh_end_time = time_module.time()
@@ -2352,15 +2362,28 @@ if PYSIDE6_AVAILABLE:
                 logger.error(f"[REFRESH ASSET] Error refreshing asset versions after {total_refresh_time:.3f}s: {e}")
                 self.update_status(f"Error refreshing asset versions: {str(e)}")
         
-        def _restore_asset_version_selection(self, asset_item, version_id):
-            """Find and select asset version by ID after parent refresh"""
+        def _restore_asset_version_selection(self, asset_item, version_id, force_refresh_components=False):
+            """Find and select asset version by ID after parent refresh
+
+            Args:
+                asset_item: Parent Asset tree item
+                version_id: AssetVersion ID to restore selection for
+                force_refresh_components: If True, load components with force_refresh to get
+                    fresh component_locations (paths) after transfer. Use when components
+                    were loaded before refresh (user had version with components selected).
+            """
+            import time as time_module
+            restore_start = time_module.time()
             try:
                 for i in range(asset_item.childCount()):
                     child = asset_item.child(i)
                     if child.data(0, ASSET_VERSION_ITEM_ID_ROLE) == version_id:
                         self.asset_version_tree.setCurrentItem(child)
-                        self.on_asset_version_selected(child, 0)
-                        logger.info(f"Restored asset version selection: {child.text(0)}")
+                        sel_start = time_module.time()
+                        self.on_asset_version_selected(child, 0, force_refresh_components=force_refresh_components)
+                        sel_ms = (time_module.time() - sel_start) * 1000
+                        restore_ms = (time_module.time() - restore_start) * 1000
+                        logger.info(f"[REFRESH RESTORE] Restored selection '{child.text(0)}' in {restore_ms:.0f}ms (on_asset_version_selected: {sel_ms:.0f}ms, force_refresh_components={force_refresh_components})")
                         break
             except Exception as e:
                 logger.error(f"Error restoring asset version selection: {e}")
