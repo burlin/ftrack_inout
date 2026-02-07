@@ -341,8 +341,17 @@ def build_job_from_hda(node) -> PublishJob:
         
         for i in range(1, component_count + 1):
             comp_name = get_parm(f'comp_name{i}') or f'component_{i}'
-            # Get evaluated path (expressions/variables expanded)
+            # Get evaluated path (expressions/variables like $F4 expanded)
             file_path = get_parm(f'file_path{i}') or ''
+            # Raw path (unexpanded) - for sequence fallback when $F4→0001 but files start at 1128
+            file_path_raw = None
+            try:
+                fp_parm = node.parm(f'file_path{i}')
+                if fp_parm and hasattr(fp_parm, 'rawValue'):
+                    file_path_raw = fp_parm.rawValue() or ''
+            except Exception:
+                pass
+            
             export_val = get_parm(f'export{i}')
             export_enabled = (export_val == 1 or export_val is True) if export_val is not None else True
             
@@ -367,7 +376,7 @@ def build_job_from_hda(node) -> PublishJob:
             frame_range = None
             
             if file_path:
-                seq_result = _detect_sequence_on_disk(file_path)
+                seq_result = _detect_sequence_on_disk(file_path, raw_path=file_path_raw)
                 if seq_result:
                     component_type = 'sequence'
                     sequence_pattern = seq_result['pattern']
@@ -446,14 +455,21 @@ def _is_sequence_pattern(path: str) -> bool:
     return False
 
 
-def _detect_sequence_on_disk(file_path: str) -> Optional[Dict[str, Any]]:
+def _detect_sequence_on_disk(
+    file_path: str,
+    raw_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """Detect sequence on disk from a single file path.
     
     Uses fileseq to find the full sequence from a single file.
-    Similar to publish HDA sequence logic.
+    When path contains Houdini $F4 (expanded to current frame), the evaluated
+    file may not exist (e.g. frame 1 when sequence starts at 1128). In that case,
+    tries findSequencesOnDisk with a wildcard pattern derived from the path.
     
     Args:
-        file_path: Path to a single file (may be part of a sequence)
+        file_path: Path to a single file (evaluated, may be part of a sequence)
+        raw_path: Raw/unexpanded path (e.g. with $F4) - used for fallback when
+            evaluated path points to non-existent file
         
     Returns:
         Dict with 'pattern', 'frame_range' if sequence found, else None
@@ -461,9 +477,12 @@ def _detect_sequence_on_disk(file_path: str) -> Optional[Dict[str, Any]]:
     if not file_path:
         return None
     
+    import os
+    import re
+    
     # Extensions that are typically sequences
     seq_extensions = ['.vdb', '.exr', '.jpg', '.jpeg', '.bgeo', '.tiff', '.tif', 
-                      '.png', '.bgeo.sc', '.geo', '.geo.sc', '.abc', '.ass']
+                      '.png', '.bgeo.sc', '.geo', '.geo.sc', '.sc', '.abc', '.ass']
     
     # Check if file has a sequence-like extension
     file_lower = file_path.lower()
@@ -472,42 +491,26 @@ def _detect_sequence_on_disk(file_path: str) -> Optional[Dict[str, Any]]:
     if not is_seq_ext:
         return None
     
-    try:
-        import fileseq as fs
-        
-        # findSequenceOnDisk takes a single file and finds the full sequence
-        seq = fs.findSequenceOnDisk(file_path)
-        
-        if seq is None or len(seq) <= 1:
-            return None
-        
-        # Get sequence info
+    def _seq_to_result(seq) -> Dict[str, Any]:
+        """Convert fileseq result to our format."""
         seq_length = len(seq)
         start_frame = seq.start()
         end_frame = seq.end()
-        
-        # Build pattern: replace frame numbers with padding
-        # fileseq gives us the pattern via format
         dirname = seq.dirname()
         basename = seq.basename()
         padding = seq.padding()
         ext = seq.extension()
         
-        # Convert padding: # → %0Nd
         if padding:
             pad_len = len(padding.replace('@', '').replace('#', ''))
             if pad_len == 0:
-                pad_len = len(str(end_frame))  # Use frame number length
+                pad_len = len(str(end_frame))
             pad_str = f'%0{pad_len}d'
         else:
-            pad_str = '%04d'  # Default 4-digit padding
+            pad_str = '%04d'
         
-        # Build full pattern path
-        import os
         pattern = os.path.join(dirname, f"{basename}{pad_str}{ext}")
         pattern = pattern.replace('\\', '/')
-        
-        # Add frame range info for ftrack
         frame_range_str = f'{start_frame}-{end_frame}'
         full_path = f"{pattern} [{frame_range_str}]"
         
@@ -515,12 +518,50 @@ def _detect_sequence_on_disk(file_path: str) -> Optional[Dict[str, Any]]:
             f"[HoudiniBridge] Sequence detected: {seq_length} frames, "
             f"range {start_frame}-{end_frame}, pattern: {pattern}"
         )
-        
         return {
             'pattern': full_path,
             'frame_range': (start_frame, end_frame),
             'length': seq_length,
         }
+    
+    try:
+        import fileseq as fs
+        
+        # 1. Try findSequenceOnDisk with evaluated path (works when file exists)
+        seq = fs.findSequenceOnDisk(file_path)
+        
+        if seq is not None and len(seq) > 1:
+            return _seq_to_result(seq)
+        
+        # 2. Fallback: evaluated path points to non-existent file (e.g. $F4→0001
+        #    when current frame is 1 but sequence on disk is 1128-1135). Build
+        #    wildcard pattern and scan directory.
+        dirname = os.path.dirname(file_path)
+        basename = os.path.basename(file_path)
+        
+        # Prefer raw_path if it contains $F - convert $F4 etc to fileseq @
+        pattern_path = None
+        if raw_path and '$F' in raw_path:
+            # Convert X:/path/maya_part.$F4.sc → X:/path/maya_part.@.sc
+            pattern_path = re.sub(r'\$F\d*', '@', raw_path)
+            pattern_path = pattern_path.replace('\\', '/')
+        else:
+            # From evaluated path maya_part.0001.sc → maya_part.@.sc
+            match = re.match(r'^(.+?)\.(\d+)\.([^.]+)$', basename)
+            if match:
+                prefix, _frame, ext = match.groups()
+                pattern_path = os.path.join(dirname, f"{prefix}.@{ext}")
+                pattern_path = pattern_path.replace('\\', '/')
+        
+        if pattern_path and os.path.isdir(dirname):
+            seqs = fs.findSequencesOnDisk(pattern_path)
+            if seqs:
+                # Pick first (or longest) sequence
+                seq = max(seqs, key=len)
+                if len(seq) > 1:
+                    return _seq_to_result(seq)
+        
+        return None
         
     except ImportError:
         _log.warning("[HoudiniBridge] fileseq not available, sequence detection disabled")

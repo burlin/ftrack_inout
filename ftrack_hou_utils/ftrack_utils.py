@@ -81,33 +81,71 @@ def query_all(query: str) -> List[Dict[str, Any]]:
         logger.error(f"Query failed: {query} - {e}", exc_info=True)
         return []
 
+def _normalize_path_for_houdini(path: str) -> str:
+    """Normalize path: backslashes to forward, %04d to $F4."""
+    path = path.replace("\\", "/")
+    if ".%04d." in path:
+        path = path.replace(".%04d.", ".$F4.")
+    return path
+
+
 def get_component_path(component: Dict[str, Any]) -> Optional[str]:
     """
     Gets the filesystem path for a given ftrack component entity.
-    Picks the standard 'ftrack.server' location.
+
+    First tries session.pick_location(). If the component is not there (e.g.
+    pick_location returns ftrack.unmanaged but component is in burlin.local),
+    iterates over all locations with 100% availability and uses the first
+    that successfully returns a path. Prefers Disk locations over S3.
     """
     session = get_session()
     if not session or not component:
         return None
-        
+
+    # 1) Try pick_location first (same as before)
     try:
         location = session.pick_location()
-        if not location:
-            raise ftrack_api.exception.LocationError("Could not pick a location for the component.")
-            
-        availability = location.get_component_availability(component)
-        if availability < 100.0:
-            logger.warning(f"Component {component['name']} is not 100% available at location '{location['name']}'. Path may be incorrect.")
-
-        path = location.get_filesystem_path(component)
-        # Normalize path for Houdini
-        path = path.replace("\\", "/")
-        if ".%04d." in path:
-            path = path.replace(".%04d.", ".$F4.")
-            
-        logger.info(f"Resolved path for component '{component['name']}': {path}")
-        return path
-
+        if location:
+            availability = location.get_component_availability(component)
+            if availability >= 100.0:
+                path = location.get_filesystem_path(component)
+                if path and str(path).strip():
+                    path = _normalize_path_for_houdini(str(path))
+                    logger.info(f"Resolved path for component '{component['name']}': {path}")
+                    return path
     except Exception as e:
-        logger.error(f"Could not get component path for '{component['name']}': {e}", exc_info=True)
-        return None 
+        logger.debug(f"pick_location path failed for '{component['name']}': {e}")
+
+    # 2) Fallback: iterate over locations where component has 100% availability
+    try:
+        locations = session.query("Location").all()
+        disk_locations = []
+        other_locations = []
+        for loc in locations:
+            try:
+                avail = loc.get_component_availability(component)
+                if avail < 100.0:
+                    continue
+                acc = getattr(loc, "accessor", None)
+                if acc and hasattr(acc, "get_filesystem_path"):
+                    if hasattr(ftrack_api.accessor, "disk") and isinstance(acc, ftrack_api.accessor.disk.DiskAccessor):
+                        disk_locations.append(loc)
+                    else:
+                        other_locations.append(loc)
+            except Exception:
+                continue
+
+        for loc in disk_locations + other_locations:
+            try:
+                path = loc.get_filesystem_path(component)
+                if path and str(path).strip():
+                    path = _normalize_path_for_houdini(str(path))
+                    logger.info(f"Resolved path for component '{component['name']}' via {loc['name']}: {path}")
+                    return path
+            except Exception as e:
+                logger.debug(f"Location {loc.get('name', '?')} get_filesystem_path failed: {e}")
+                continue
+    except Exception as e:
+        logger.error(f"Fallback location iteration failed for '{component['name']}': {e}", exc_info=True)
+
+    return None 
