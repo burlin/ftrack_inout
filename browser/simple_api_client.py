@@ -155,16 +155,55 @@ def _is_sequence_path(path: str) -> bool:
     return False
 
 
-def _build_component_display_name(comp_name: str, file_type: str, path: str) -> str:
-    """Build display name: for sequences show pattern (e.g. .%04d.sc), for single files show file_type."""
+from .browser_config_loader import (
+    get_show_sequence_frame_range,
+    get_project_filter_statuses,
+)
+
+
+def _frame_range_from_names(names: list) -> tuple[int | None, int | None]:
+    """Return (frame_min, frame_max) from list of name strings (frame numbers), or (None, None)."""
+    if not names:
+        return None, None
+    frames = []
+    for name in names:
+        if name is None:
+            continue
+        try:
+            frames.append(int(name))
+        except (ValueError, TypeError):
+            continue
+    if not frames:
+        return None, None
+    return min(frames), max(frames)
+
+
+def _build_component_display_name(
+    comp_name: str, file_type: str, path: str,
+    member_count: int | None = None, padding: int | None = None,
+    frame_min: int | None = None, frame_max: int | None = None
+) -> str:
+    """Build display name: for sequences show pattern and range, e.g. name (.%04d.sc) 1001 - 1721 (720)."""
     if not comp_name:
         comp_name = 'Unknown'
+    if member_count is not None and frame_min is not None and frame_max is not None:
+        count_suffix = f" {frame_min} - {frame_max} ({member_count})"
+    elif member_count is not None:
+        count_suffix = f" {member_count}"
+    else:
+        count_suffix = ""
     if _is_sequence_path(path):
         basename = os.path.basename(path)
         if basename.startswith(comp_name):
             suffix = basename[len(comp_name):]
             if suffix.startswith('.'):
-                return f"{comp_name} ({suffix})"
+                return f"{comp_name} ({suffix}){count_suffix}"
+    if member_count is not None and (padding is not None or file_type):
+        pad = padding if padding is not None else 4
+        pattern = f".%0{pad}d.{file_type}" if file_type else f".%0{pad}d"
+        if frame_min is not None and frame_max is not None:
+            return f"{comp_name} ({pattern}) {frame_min} - {frame_max} ({member_count})"
+        return f"{comp_name} ({pattern}) {member_count}"
     if file_type:
         return f"{comp_name} ({file_type})"
     return comp_name
@@ -691,69 +730,69 @@ class FtrackApiClient:
     # === API METHODS ===
 
     def get_projects(self):
-        """Get all active projects - USE CACHE via session.get()"""
+        """Get projects; filter by status from browser_config.yaml if project_filter.enabled."""
         if not self.session:
             return []
         try:
-            # WORKAROUND for session.get() issue - use direct query
-            # This will still use cache, but safer
             logger.info("Loading projects via direct query (still uses cache)...")
             projects = self.session.query('Project').all()
-            
             logger.info(f"Loaded {len(projects)} projects from cache via query")
-            
-            # Filter active projects in Python
-            active_projects = []
+
+            allowed_statuses = get_project_filter_statuses()
+            if allowed_statuses:
+                try:
+                    self.session.populate(projects, 'status')
+                except Exception:
+                    pass
+            if not allowed_statuses:
+                return projects
+
+            allowed_lower = [s.lower() for s in allowed_statuses]
+            filtered = []
             for p in projects:
                 try:
                     status = p.get('status')
-                    # status can be string or object
-                    if status:
-                        if isinstance(status, str):
-                            # If status is string, check directly
-                            if status == 'Active':
-                                active_projects.append(p)
-                        elif hasattr(status, 'get'):
-                            # If status is object, check name
-                            if status.get('name') == 'Active':
-                                active_projects.append(p)
-                        else:
-                            # Unknown status type, add project
-                            active_projects.append(p)
-                    else:
-                        # No status, add project
-                        active_projects.append(p)
+                    name = status if isinstance(status, str) else (status.get('name') if hasattr(status, 'get') else None)
+                    if name is not None and name.lower() in allowed_lower:
+                        filtered.append(p)
                 except Exception as status_error:
                     logger.warning(f"Error checking project status: {status_error}")
-                    # If can't determine status, add project
-                    active_projects.append(p)
-            
-            logger.info(f"Found {len(active_projects)} active projects")
-            return active_projects
-            
+                    filtered.append(p)
+            # If filter matched nothing, return all projects so UI is not empty (e.g. status names differ in server)
+            if not filtered and projects:
+                logger.warning(
+                    f"Project filter matched 0 projects (allowed: {allowed_statuses}). Showing all {len(projects)} projects."
+                )
+                return projects
+            logger.info(f"Filtered to {len(filtered)} projects (statuses: {allowed_statuses})")
+            return filtered
+
         except Exception as e:
             logger.error(f"Failed to get projects from cache: {e}")
-            # Fallback - old method via query
             try:
                 logger.info("Fallback to direct query...")
                 projects = self.session.query('Project').all()
-                # Safe filtering of active projects
-                active_projects = []
+                allowed_statuses = get_project_filter_statuses()
+                if not allowed_statuses:
+                    return projects
+                try:
+                    self.session.populate(projects, 'status')
+                except Exception:
+                    pass
+                allowed_lower = [s.lower() for s in allowed_statuses]
+                filtered = []
                 for p in projects:
                     try:
                         status = p.get('status')
-                        if status:
-                            if isinstance(status, str) and status == 'Active':
-                                active_projects.append(p)
-                            elif hasattr(status, 'get') and status.get('name') == 'Active':
-                                active_projects.append(p)
-                            else:
-                                active_projects.append(p)  # Add all projects if can't determine
-                        else:
-                            active_projects.append(p)
-                    except:
-                        active_projects.append(p)
-                return active_projects
+                        name = status if isinstance(status, str) else (status.get('name') if hasattr(status, 'get') else None)
+                        if name is not None and name.lower() in allowed_lower:
+                            filtered.append(p)
+                    except Exception:
+                        filtered.append(p)
+                if not filtered and projects:
+                    logger.warning("Project filter matched 0 projects in fallback. Showing all.")
+                    return projects
+                return filtered
             except Exception as e2:
                 logger.error(f"Fallback project query also failed: {e2}")
                 return []
@@ -955,6 +994,14 @@ class FtrackApiClient:
         except Exception as e:
             logger.warning(f"Error picking location: {e}")
 
+        # Batch populate members for all SequenceComponents (one round-trip)
+        sequence_components = [c for c in components_data if getattr(c, 'entity_type', None) == 'SequenceComponent']
+        if sequence_components:
+            try:
+                self.session.populate(sequence_components, 'members')
+            except Exception:
+                pass
+
         for comp in components_data:
             path = "N/A"
             if location:
@@ -967,7 +1014,18 @@ class FtrackApiClient:
             
             comp_name = comp.get('name', 'Unknown Component')
             file_type = comp.get('file_type', '')
-            display_name = _build_component_display_name(comp_name, file_type, path or '')
+            members = comp.get('members') or []
+            member_count = len(members) if getattr(comp, 'entity_type', None) == 'SequenceComponent' else None
+            padding = comp.get('padding') if member_count is not None else None
+            frame_min = frame_max = None
+            if get_show_sequence_frame_range() and member_count:
+                names = [m.get('name') for m in members]
+                frame_min, frame_max = _frame_range_from_names(names)
+            display_name = _build_component_display_name(
+                comp_name, file_type, path or '',
+                member_count=member_count, padding=padding,
+                frame_min=frame_min, frame_max=frame_max
+            )
             
             processed_components.append({
                 'id': comp['id'],

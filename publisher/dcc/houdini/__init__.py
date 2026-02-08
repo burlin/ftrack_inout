@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 _log = logging.getLogger(__name__)
@@ -578,6 +579,9 @@ def _detect_sequence_on_disk(
 def publish_callback():
     """Main publish callback for HDA button.
     
+    If HDA parm 'publish_in_background' is true, runs publish in a separate thread
+    so Houdini stays responsive; result is shown and node updated on main thread.
+    
     Call this from HDA 'Render' button callback:
         from ftrack_inout.publisher.dcc.houdini import publish_callback
         publish_callback()
@@ -588,8 +592,17 @@ def publish_callback():
     
     node = hou.pwd()
     
+    # Read "Publish in background" checkbox (HDA parm: publish_in_background)
+    publish_in_background = False
+    parm = node.parm("publish_in_background")
+    if parm is not None:
+        try:
+            publish_in_background = bool(parm.eval())
+        except Exception:
+            pass
+    
     try:
-        # Build job
+        # Build job (on main thread; job is plain data)
         job = build_job_from_hda(node)
         
         # Validate
@@ -599,7 +612,7 @@ def publish_callback():
             hou.ui.displayMessage(error_msg, severity=hou.severityType.Error)
             return
         
-        # Get Ftrack session
+        # Get Ftrack session (needed for both paths)
         session = _get_ftrack_session()
         if not session:
             hou.ui.displayMessage(
@@ -609,33 +622,69 @@ def publish_callback():
             )
             return
         
-        # Execute publish
+        if publish_in_background:
+            _run_publish_in_background(job, node)
+            hou.ui.displayMessage(
+                "Publish started in background.\nYou can keep working; a message will show when done.",
+                severity=hou.severityType.Message
+            )
+            return
+        
+        # Execute publish on main thread (blocking)
         publisher = Publisher(session=session, dry_run=False)
         result = publisher.execute(job)
-        
-        if result.success:
-            msg = (
-                f"Published successfully!\n\n"
-                f"Asset Version: #{result.asset_version_number}\n"
-                f"Components: {len(result.component_ids)}\n\n"
-                f"Component IDs:\n" +
-                "\n".join(f"  - {cid}" for cid in result.component_ids)
-            )
-            hou.ui.displayMessage(msg, severity=hou.severityType.Message)
-            
-            # Update node parameters with result
-            _update_node_after_publish(node, result)
-        else:
-            hou.ui.displayMessage(
-                f"Publish failed:\n{result.error_message}",
-                severity=hou.severityType.Error
-            )
+        _show_publish_result_and_update_node(node, result)
             
     except Exception as e:
         import traceback
         _log.error(f"[HoudiniBridge] Publish error: {e}", exc_info=True)
         hou.ui.displayMessage(
             f"Publish error:\n{e}\n\n{traceback.format_exc()}",
+            severity=hou.severityType.Error
+        )
+
+
+def _run_publish_in_background(job: "PublishJob", node: "hou.Node"):
+    """Run publish in a worker thread; on completion run UI update on main thread."""
+    node_path = node.path()
+    
+    def worker():
+        result = None
+        try:
+            # Use a new session in the thread (ftrack session is not thread-safe to share)
+            import ftrack_api
+            session = ftrack_api.Session(auto_connect_event_hub=False)
+            publisher = Publisher(session=session, dry_run=False)
+            result = publisher.execute(job)
+        except Exception as e:
+            import traceback
+            _log.error(f"[HoudiniBridge] Background publish error: {e}", exc_info=True)
+            result = PublishResult(success=False, error_message=f"{e}\n{traceback.format_exc()}")
+        
+        if result is not None and HOUDINI_AVAILABLE:
+            hou.executeInMainThreadWithResult(
+                lambda: _show_publish_result_and_update_node(hou.node(node_path), result)
+            )
+    
+    thread = threading.Thread(target=worker, name="FtPublishBackground", daemon=True)
+    thread.start()
+
+
+def _show_publish_result_and_update_node(node: "hou.Node", result: "PublishResult"):
+    """Show result message and update node params; must run on main thread."""
+    if result.success:
+        msg = (
+            f"Published successfully!\n\n"
+            f"Asset Version: #{result.asset_version_number}\n"
+            f"Components: {len(result.component_ids)}\n\n"
+            f"Component IDs:\n" +
+            "\n".join(f"  - {cid}" for cid in result.component_ids)
+        )
+        hou.ui.displayMessage(msg, severity=hou.severityType.Message)
+        _update_node_after_publish(node, result)
+    else:
+        hou.ui.displayMessage(
+            f"Publish failed:\n{result.error_message}",
             severity=hou.severityType.Error
         )
 

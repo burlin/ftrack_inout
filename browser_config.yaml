@@ -1,0 +1,22 @@
+# Browser configuration (ftrack_inout plugin level, not per-DCC)
+# Path: ftrack_plugins/ftrack_inout/browser_config.yaml
+
+# Sequence component display in the components list.
+# true  — show frame range and count: "name (.%04d.sc) 1001 - 1721 (720)" (reads member names, can be slow for long sequences).
+# false — show only pattern and count: "name (.%04d.sc) (720)".
+show_sequence_frame_range: false
+
+# Project list filter: only show projects whose status is in the list.
+# enabled: true  — show only projects with status in statuses (e.g. только активные).
+# enabled: false — show all projects (statuses ignored).
+# statuses: names as in your ftrack workspace (Project status field). Names are workspace-specific.
+#   Typical variants (проверьте в вашем workspace: Help → API reference или выпадающий статус проекта):
+#   - "Active"   — активные проекты (часто по умолчанию)
+#   - "Archived" — архивированные
+#   - "Backup"   — бэкапные / резервные
+#   - "On hold"  — на паузе
+#   Можно несколько: ["Active", "On hold"]. Пустой список при enabled: true = не показывать ни один проект.
+project_filter:
+  enabled: true
+  statuses:
+    - "Active"

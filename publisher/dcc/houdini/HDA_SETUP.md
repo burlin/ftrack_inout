@@ -348,9 +348,27 @@ def _get_session():
 
 ---
 
+## Параметр «Паблишить в фоне» (publish_in_background)
+
+Чекбокс: запускать паблиш в отдельном потоке, чтобы Houdini не блокировался (копирование файлов и API идут в фоне).
+
+| Name | Label | Type | Location |
+|------|-------|------|----------|
+| `publish_in_background` | Publish in background | Toggle | Рядом с кнопкой Publish / перед comment |
+
+Настройки:
+- Type: Toggle
+- Default: 0 (выключено)
+- Label можно: «Publish in background» / «Паблишить в фоне» / «Не блокировать Houdini»
+
+Если включено: после нажатия Publish показывается «Publish started in background...», паблиш выполняется в потоке, по завершении на главном потоке показывается результат и обновляются параметры ноды.
+
+---
+
 ## Checklist для обновления HDA
 
 - [ ] Добавить параметр `comment` (String, multiline)
+- [ ] Добавить параметр `publish_in_background` (Toggle) — паблиш в отдельном потоке
 - [ ] Обновить PythonModule с новыми callback функциями
 - [ ] Настроить prerender скрипт на Shell ROP: `hou.pwd().parent().hdaModule().publish()`
 - [ ] Опционально: добавить кнопку Test с callback `hou.phm().publish_dry_run()`

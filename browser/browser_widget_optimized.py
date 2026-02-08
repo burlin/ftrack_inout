@@ -55,16 +55,51 @@ def _is_sequence_path(path):
     return False
 
 
-def _build_component_display_name(comp_name, file_type, path):
-    """Build display name: for sequences show pattern (e.g. .%04d.sc), for single files show file_type."""
+from .browser_config_loader import (
+    get_show_sequence_frame_range,
+    get_project_filter_statuses,
+)
+
+
+def _frame_range_from_names(names):
+    """Return (frame_min, frame_max) from list of name strings (frame numbers), or (None, None)."""
+    if not names:
+        return None, None
+    frames = []
+    for name in names:
+        if name is None:
+            continue
+        try:
+            frames.append(int(name))
+        except (ValueError, TypeError):
+            continue
+    if not frames:
+        return None, None
+    return min(frames), max(frames)
+
+
+def _build_component_display_name(comp_name, file_type, path, member_count=None, padding=None, frame_min=None, frame_max=None):
+    """Build display name: for sequences show pattern and range, e.g. name (.%04d.sc) 1001 - 1721 (720)."""
     if not comp_name:
         comp_name = 'Unknown'
+    if member_count is not None and frame_min is not None and frame_max is not None:
+        count_suffix = f" {frame_min} - {frame_max} ({member_count})"
+    elif member_count is not None:
+        count_suffix = f" {member_count}"
+    else:
+        count_suffix = ""
     if _is_sequence_path(path):
         basename = os.path.basename(path)
         if basename.startswith(comp_name):
             suffix = basename[len(comp_name):]
             if suffix.startswith('.'):
-                return f"{comp_name} ({suffix})"
+                return f"{comp_name} ({suffix}){count_suffix}"
+    if member_count is not None and (padding is not None or file_type):
+        pad = padding if padding is not None else 4
+        pattern = f".%0{pad}d.{file_type}" if file_type else f".%0{pad}d"
+        if frame_min is not None and frame_max is not None:
+            return f"{comp_name} ({pattern}) {frame_min} - {frame_max} ({member_count})"
+        return f"{comp_name} ({pattern}) {member_count}"
     if file_type:
         return f"{comp_name} ({file_type})"
     return comp_name
@@ -190,10 +225,29 @@ class OptimizedFtrackApiClient:
                     logger.warning(f"SimpleFtrackApiClient.get_projects failed: {e}")
                     # Fall through to direct query
             
-            # Fallback: direct query
+            # Fallback: direct query + same project filter as simple_api_client
             logger.info("Using fallback direct query for projects")
             projects = self.session.query('Project').all()
-            return projects  # Return ftrack entities directly, not dicts
+            allowed_statuses = get_project_filter_statuses()
+            if not allowed_statuses:
+                return projects
+            try:
+                self.session.populate(projects, 'status')
+            except Exception:
+                pass
+            allowed_lower = [s.lower() for s in allowed_statuses]
+            filtered = []
+            for p in projects:
+                try:
+                    status = p.get('status')
+                    name = status if isinstance(status, str) else (status.get('name') if hasattr(status, 'get') else None)
+                    if name is not None and name.lower() in allowed_lower:
+                        filtered.append(p)
+                except Exception:
+                    filtered.append(p)
+            if not filtered and projects:
+                return projects
+            return filtered
             
         except Exception as e:
             logger.error(f"Failed to get projects: {e}")
@@ -570,30 +624,48 @@ class OptimizedFtrackApiClient:
             if cached_count > 0:
                 logger.info(f"[CACHE] {cached_count}/{len(component_ids)} components already cached, will use fast path")
             
+            component_entities = []
             for component_id in component_ids:
                 try:
-                    # This uses the optimized cache (fast for cached, fetches for uncached)
                     component = self.session.get('Component', component_id)
                     if component:
-                        comp_name = component.get('name', '')
-                        file_type = component.get('file_type', '')
-                        
-                        # Create display_name as in the original
-                        if file_type:
-                            display_name = f"{comp_name} ({file_type})"
-                        else:
-                            display_name = comp_name
-                        
-                        result.append({
-                            'id': component['id'],
-                            'name': comp_name,
-                            'display_name': display_name,
-                            'file_type': file_type,
-                            'size': component.get('size', 0)
-                        })
+                        component_entities.append(component)
                 except Exception as e:
                     logger.warning(f"Failed to get component {component_id}: {e}")
-                    continue
+            
+            # Batch populate members for all SequenceComponents (one round-trip)
+            sequence_components = [c for c in component_entities if getattr(c, 'entity_type', None) == 'SequenceComponent']
+            if sequence_components:
+                try:
+                    self.session.populate(sequence_components, 'members')
+                except Exception as e:
+                    logger.debug(f"Batch populate members: {e}")
+            
+            for component in component_entities:
+                try:
+                    comp_name = component.get('name', '')
+                    file_type = component.get('file_type', '')
+                    members = component.get('members') or []
+                    member_count = len(members) if getattr(component, 'entity_type', None) == 'SequenceComponent' else None
+                    padding = component.get('padding') if member_count is not None else None
+                    frame_min = frame_max = None
+                    if get_show_sequence_frame_range() and member_count:
+                        names = [m.get('name') for m in members]
+                        frame_min, frame_max = _frame_range_from_names(names)
+                    display_name = _build_component_display_name(
+                        comp_name, file_type, '',
+                        member_count=member_count, padding=padding,
+                        frame_min=frame_min, frame_max=frame_max
+                    )
+                    result.append({
+                        'id': component['id'],
+                        'name': comp_name,
+                        'display_name': display_name,
+                        'file_type': file_type,
+                        'size': component.get('size', 0)
+                    })
+                except Exception as e:
+                    logger.warning(f"Failed to process component {component.get('id', 'N/A')}: {e}")
             
             batch_time = time.time() - batch_start
             total_time = time.time() - start_time
@@ -723,6 +795,14 @@ class OptimizedFtrackApiClient:
             get_time = time.time() - get_start
             logger.debug(f"[TIMING] Batch get {len(component_entities)} components took {get_time*1000:.2f}ms")
             
+            # Batch populate members for all SequenceComponents (one round-trip instead of N)
+            sequence_components = [c for c in component_entities if getattr(c, 'entity_type', None) == 'SequenceComponent']
+            if sequence_components:
+                try:
+                    self.session.populate(sequence_components, 'members')
+                except Exception as e:
+                    logger.debug(f"Batch populate members: {e}")
+            
             # Use full component entities for path resolution
             for component in component_entities:
                 try:
@@ -740,8 +820,23 @@ class OptimizedFtrackApiClient:
                     comp_name = component.get('name', '')
                     file_type = component.get('file_type', '')
                     
-                    # For sequences: show pattern (e.g. maya_part (.%04d.sc)); for single files: maya_part (.sc)
-                    display_name = _build_component_display_name(comp_name, file_type, path)
+                    # For SequenceComponent: member count and frame range (already loaded via batch populate)
+                    member_count = None
+                    padding = None
+                    frame_min = frame_max = None
+                    if getattr(component, 'entity_type', None) == 'SequenceComponent':
+                        members = component.get('members') or []
+                        member_count = len(members)
+                        padding = component.get('padding')
+                        if get_show_sequence_frame_range() and member_count:
+                            names = [m.get('name') for m in members]
+                            frame_min, frame_max = _frame_range_from_names(names)
+                    
+                    display_name = _build_component_display_name(
+                        comp_name, file_type, path,
+                        member_count=member_count, padding=padding,
+                        frame_min=frame_min, frame_max=frame_max
+                    )
 
                     # Collect location names where component is available (fresh from populate if force_refresh)
                     locations = []
