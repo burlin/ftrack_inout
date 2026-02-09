@@ -2,8 +2,8 @@
 # Path: ftrack_plugins/ftrack_inout/browser_config.yaml
 
 # Sequence component display in the components list.
-# true  — show frame range and count: "name (.%04d.sc) 1001 - 1721 (720)" (reads member names, can be slow for long sequences).
-# false — show only pattern and count: "name (.%04d.sc) (720)".
+# true  — show frame range and count: "name (.%04d.sc) 1001 - 1721 (720)" — loads all members (~10s per component for long sequences).
+# false — show pattern only, no member count: "name (.%04d.sc)" — fast, no member load.
 show_sequence_frame_range: false
 
 # Project list filter: only show projects whose status is in the list.
@@ -12,7 +12,8 @@ show_sequence_frame_range: false
 # statuses: names as in your ftrack workspace (Project status field). Names are workspace-specific.
 #   Typical variants (проверьте в вашем workspace: Help → API reference или выпадающий статус проекта):
 #   - "Active"   — активные проекты (часто по умолчанию)
-#   - "Archived" — архивированные
+#   - "Archived" — архивированныеcd ..
+
 #   - "Backup"   — бэкапные / резервные
 #   - "On hold"  — на паузе
 #   Можно несколько: ["Active", "On hold"]. Пустой список при enabled: true = не показывать ни один проект.

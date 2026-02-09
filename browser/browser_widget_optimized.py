@@ -633,9 +633,9 @@ class OptimizedFtrackApiClient:
                 except Exception as e:
                     logger.warning(f"Failed to get component {component_id}: {e}")
             
-            # Batch populate members for all SequenceComponents (one round-trip)
+            # Batch populate members only when needed for frame range display (show_sequence_frame_range)
             sequence_components = [c for c in component_entities if getattr(c, 'entity_type', None) == 'SequenceComponent']
-            if sequence_components:
+            if sequence_components and get_show_sequence_frame_range():
                 try:
                     self.session.populate(sequence_components, 'members')
                 except Exception as e:
@@ -645,13 +645,19 @@ class OptimizedFtrackApiClient:
                 try:
                     comp_name = component.get('name', '')
                     file_type = component.get('file_type', '')
-                    members = component.get('members') or []
-                    member_count = len(members) if getattr(component, 'entity_type', None) == 'SequenceComponent' else None
-                    padding = component.get('padding') if member_count is not None else None
+                    member_count = None
+                    padding = None
                     frame_min = frame_max = None
-                    if get_show_sequence_frame_range() and member_count:
-                        names = [m.get('name') for m in members]
-                        frame_min, frame_max = _frame_range_from_names(names)
+                    if getattr(component, 'entity_type', None) == 'SequenceComponent':
+                        if get_show_sequence_frame_range():
+                            members = component.get('members') or []
+                            member_count = len(members)
+                            padding = component.get('padding')
+                            if member_count:
+                                names = [m.get('name') for m in members]
+                                frame_min, frame_max = _frame_range_from_names(names)
+                        else:
+                            padding = component.get('padding')
                     display_name = _build_component_display_name(
                         comp_name, file_type, '',
                         member_count=member_count, padding=padding,
@@ -793,15 +799,24 @@ class OptimizedFtrackApiClient:
                     logger.warning(f"Failed to get component {comp_data['id']}: {e}")
                     continue
             get_time = time.time() - get_start
-            logger.debug(f"[TIMING] Batch get {len(component_entities)} components took {get_time*1000:.2f}ms")
+            logger.debug(f"[TIMING] session.get(Component) x{len(component_entities)}: {get_time*1000:.2f}ms")
             
-            # Batch populate members for all SequenceComponents (one round-trip instead of N)
+            # Batch populate members only when needed for frame range display (show_sequence_frame_range)
             sequence_components = [c for c in component_entities if getattr(c, 'entity_type', None) == 'SequenceComponent']
-            if sequence_components:
+            need_members = get_show_sequence_frame_range()
+            if sequence_components and need_members:
                 try:
                     self.session.populate(sequence_components, 'members')
                 except Exception as e:
                     logger.debug(f"Batch populate members: {e}")
+            elif sequence_components and not need_members:
+                logger.debug("[PERF] Skipping populate(members) - show_sequence_frame_range=False")
+            
+            # Batch populate component_locations to avoid N lazy loads in the loop below
+            try:
+                self.session.populate(component_entities, 'component_locations.location.name, component_locations.location.label')
+            except Exception as e:
+                logger.debug(f"Batch populate component_locations: {e}")
             
             # Use full component entities for path resolution
             for component in component_entities:
@@ -820,17 +835,22 @@ class OptimizedFtrackApiClient:
                     comp_name = component.get('name', '')
                     file_type = component.get('file_type', '')
                     
-                    # For SequenceComponent: member count and frame range (already loaded via batch populate)
+                    # For SequenceComponent: member count and frame range
+                    # IMPORTANT: Only access component.get('members') when show_sequence_frame_range - otherwise
+                    # it triggers lazy load of all 170+ members (~10s). When False, skip entirely.
                     member_count = None
                     padding = None
                     frame_min = frame_max = None
                     if getattr(component, 'entity_type', None) == 'SequenceComponent':
-                        members = component.get('members') or []
-                        member_count = len(members)
-                        padding = component.get('padding')
-                        if get_show_sequence_frame_range() and member_count:
-                            names = [m.get('name') for m in members]
-                            frame_min, frame_max = _frame_range_from_names(names)
+                        if get_show_sequence_frame_range():
+                            members = component.get('members') or []
+                            member_count = len(members)
+                            padding = component.get('padding')
+                            if member_count:
+                                names = [m.get('name') for m in members]
+                                frame_min, frame_max = _frame_range_from_names(names)
+                        else:
+                            padding = component.get('padding')  # padding is on component, no lazy load
                     
                     display_name = _build_component_display_name(
                         comp_name, file_type, path,

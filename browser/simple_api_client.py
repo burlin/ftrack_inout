@@ -994,9 +994,9 @@ class FtrackApiClient:
         except Exception as e:
             logger.warning(f"Error picking location: {e}")
 
-        # Batch populate members for all SequenceComponents (one round-trip)
+        # Batch populate members only when needed for frame range display (show_sequence_frame_range)
         sequence_components = [c for c in components_data if getattr(c, 'entity_type', None) == 'SequenceComponent']
-        if sequence_components:
+        if sequence_components and get_show_sequence_frame_range():
             try:
                 self.session.populate(sequence_components, 'members')
             except Exception:
@@ -1014,13 +1014,19 @@ class FtrackApiClient:
             
             comp_name = comp.get('name', 'Unknown Component')
             file_type = comp.get('file_type', '')
-            members = comp.get('members') or []
-            member_count = len(members) if getattr(comp, 'entity_type', None) == 'SequenceComponent' else None
-            padding = comp.get('padding') if member_count is not None else None
+            member_count = None
+            padding = None
             frame_min = frame_max = None
-            if get_show_sequence_frame_range() and member_count:
-                names = [m.get('name') for m in members]
-                frame_min, frame_max = _frame_range_from_names(names)
+            if getattr(comp, 'entity_type', None) == 'SequenceComponent':
+                if get_show_sequence_frame_range():
+                    members = comp.get('members') or []
+                    member_count = len(members)
+                    padding = comp.get('padding')
+                    if member_count:
+                        names = [m.get('name') for m in members]
+                        frame_min, frame_max = _frame_range_from_names(names)
+                else:
+                    padding = comp.get('padding')
             display_name = _build_component_display_name(
                 comp_name, file_type, path or '',
                 member_count=member_count, padding=padding,
