@@ -17,6 +17,7 @@ Create node (Houdini) is DCC-specific and has no meaning in standalone.
 See finput_hda_interface_spec.yaml for full HDA parameter reference.
 """
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
@@ -86,10 +87,35 @@ class FtrackInputWidget(QtWidgets.QWidget):
         self._current_asset_id: Optional[str] = None
         self._current_version_id: Optional[str] = None
         self._current_component_id: Optional[str] = None
+        self._current_component_name: Optional[str] = None
         self._asset_cache: Dict[str, Any] = {}
+        self._subscription_key: Optional[str] = None
+        self._pending_update_data: Optional[Dict[str, Any]] = None
+        self._version_components_cache: Dict[str, list] = {}
+        # Core-based cached data (ftrack_inout.input) - used when session available
+        self._version_cached_data: Optional[Dict[str, Any]] = None
 
         self._build_ui()
         self._connect_signals()
+
+    def closeEvent(self, event: Any) -> None:
+        """Unsubscribe and remove log handler on close."""
+        if getattr(self, "_log_handler", None):
+            for name in ("ftrack_inout.browser", "ftrack_inout.input", "ftrack_inout.browser.ftrack_input_widget"):
+                try:
+                    logging.getLogger(name).removeHandler(self._log_handler)
+                except Exception:
+                    pass
+        if self._subscription_key:
+            try:
+                from .asset_update_listener_standalone import get_listener
+                listener = get_listener()
+                if listener:
+                    listener.unsubscribe(self._subscription_key)
+            except Exception:
+                pass
+            self._subscription_key = None
+        super().closeEvent(event)
 
     def _get_api_client(self) -> Optional["FtrackApiClient"]:
         if self._api_client is not None:
@@ -147,27 +173,54 @@ class FtrackInputWidget(QtWidgets.QWidget):
         # --- Separator ---
         layout.addWidget(self._hline())
 
-        # --- 3 main fields (loader core) ---
+        # --- Main fields (loader core) - order matches Houdini finput HDA ---
         form = QtWidgets.QFormLayout()
         form.setSpacing(4)
         self._asset_version_edit = QtWidgets.QLineEdit()
         self._asset_version_edit.setPlaceholderText("Asset Version id (from web/browser)")
+        form.addRow("Asset Version:", self._asset_version_edit)
+
+        # Component Id + Subscribe (same row as in Houdini)
+        compid_row = QtWidgets.QHBoxLayout()
+        compid_row.setSpacing(8)
         self._component_id_edit = QtWidgets.QLineEdit()
         self._component_id_edit.setPlaceholderText("Component Id (priority: if set, overrides Version+Name)")
-        self._component_name_combo = QtWidgets.QComboBox()
-        self._component_name_combo.setEnabled(False)
-        self._component_name_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
-        self._component_name_combo.setToolTip("Components for current Asset Version; selecting one sets Component Id.")
-        form.addRow("Asset Version:", self._asset_version_edit)
-        form.addRow("Component Id:", self._component_id_edit)
-        form.addRow("Component Name:", self._component_name_combo)
+        compid_row.addWidget(self._component_id_edit, 1)
+        self._subscribe_cb = QtWidgets.QCheckBox("Subscribe to Updates")
+        self._subscribe_cb.setToolTip("Watch for new versions of this component (requires component selected).")
+        compid_row.addWidget(self._subscribe_cb)
+        form.addRow("Component Id:", compid_row)
+
+        # Component Name + Version menu + Component menu (Houdini: ComponentName + version_menu + component_menu, JoinWithNext)
+        # All in one row; Component Name always visible; Version/Component combos empty+disabled until get_data
+        self._name_menus_row = QtWidgets.QWidget()
+        name_menus_layout = QtWidgets.QHBoxLayout(self._name_menus_row)
+        name_menus_layout.setContentsMargins(0, 0, 0, 0)
+        name_menus_layout.setSpacing(8)
+        name_menus_layout.addWidget(QtWidgets.QLabel("Component Name:"))
+        self._component_name_edit = QtWidgets.QLineEdit()
+        self._component_name_edit.setReadOnly(True)
+        self._component_name_edit.setPlaceholderText("(from component menu)")
+        self._component_name_edit.setMinimumWidth(100)
+        name_menus_layout.addWidget(self._component_name_edit)
+        name_menus_layout.addWidget(QtWidgets.QLabel("Version:"))
+        self._version_combo_main = QtWidgets.QComboBox()
+        self._version_combo_main.setMinimumWidth(85)
+        self._version_combo_main.setEnabled(False)
+        self._version_combo_main.setToolTip("Version menu - select version.")
+        name_menus_layout.addWidget(self._version_combo_main)
+        name_menus_layout.addWidget(QtWidgets.QLabel("Component:"))
+        self._component_menu_combo = QtWidgets.QComboBox()
+        self._component_menu_combo.setMinimumWidth(120)
+        self._component_menu_combo.setEnabled(False)
+        self._component_menu_combo.setToolTip("Component menu - select component.")
+        name_menus_layout.addWidget(self._component_menu_combo, 1)
+        form.addRow(self._name_menus_row)
+        self._menus_row = self._name_menus_row  # Alias for compatibility
+
         layout.addLayout(form)
 
-        # Subscribe to Updates
-        self._subscribe_cb = QtWidgets.QCheckBox("Subscribe to Updates")
-        layout.addWidget(self._subscribe_cb)
-
-        # --- Buttons: get from assetver (Component Id has priority), transfer, accept update ---
+        # --- Buttons (matches Houdini) ---
         btn_row = QtWidgets.QHBoxLayout()
         self._get_from_assetver_btn = QtWidgets.QPushButton("get from assetver")
         self._get_from_assetver_btn.setToolTip("If Component Id set: fill Version+Name from it, then path. Else: from Version+Component Name → Component Id + path.")
@@ -195,6 +248,16 @@ class FtrackInputWidget(QtWidgets.QWidget):
         self._message_label.setWordWrap(True)
         layout.addWidget(self._message_label)
 
+        # --- Log (visible by default for debugging) ---
+        self._log_text = QtWidgets.QTextEdit()
+        self._log_text.setReadOnly(True)
+        self._log_text.setMaximumHeight(120)
+        self._log_text.setPlaceholderText("Log output...")
+        self._log_text.setFontFamily("Consolas")
+        self._log_text.setFontPointSize(9)
+        layout.addWidget(self._log_text)
+        self._setup_log_handler()
+
         # --- show variables ---
         self._show_vars_cb = QtWidgets.QCheckBox("show variables")
         layout.addWidget(self._show_vars_cb)
@@ -219,11 +282,42 @@ class FtrackInputWidget(QtWidgets.QWidget):
         line.setFrameShadow(QtWidgets.QFrame.Sunken)
         return line
 
+    def _setup_log_handler(self) -> None:
+        """Add handler to show log output in widget."""
+        class TextEditHandler(logging.Handler):
+            def __init__(self, text_edit: QtWidgets.QTextEdit) -> None:
+                super().__init__()
+                self._text_edit = text_edit
+
+            def emit(self, record: logging.LogRecord) -> None:
+                try:
+                    msg = self.format(record)
+                    self._text_edit.append(msg)
+                    # Keep last ~500 lines
+                    text = self._text_edit.toPlainText()
+                    lines = text.split("\n")
+                    if len(lines) > 500:
+                        self._text_edit.setPlainText("\n".join(lines[-450:]))
+                except Exception:
+                    pass
+
+        h = TextEditHandler(self._log_text)
+        h.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s:%(name)s:%(message)s", datefmt="%H:%M:%S"))
+        h.setLevel(logging.DEBUG)
+        for name in ("ftrack_inout.browser", "ftrack_inout.input", "ftrack_inout.browser.ftrack_input_widget"):
+            lg = logging.getLogger(name)
+            lg.addHandler(h)
+            lg.setLevel(logging.DEBUG)
+        self._log_handler = h
+
     def _connect_signals(self) -> None:
         self._use_custom_cb.toggled.connect(self._on_use_custom_toggled)
         self._get_from_assetver_btn.clicked.connect(self._on_get_from_assetver)
         self._transfer_btn.clicked.connect(self._on_transfer_clicked)
-        self._component_name_combo.currentIndexChanged.connect(self._on_component_name_combo_changed)
+        self._accept_update_btn.clicked.connect(self._on_accept_update)
+        self._component_menu_combo.currentIndexChanged.connect(self._on_component_menu_combo_changed)
+        self._version_combo_main.currentIndexChanged.connect(self._on_version_combo_main_changed)
+        self._subscribe_cb.toggled.connect(self._on_subscribe_toggled)
         self._show_vars_cb.toggled.connect(self._variables_text.setVisible)
         self._show_vars_cb.toggled.connect(self._metadict_text.setVisible)
         self._check_taskid_btn.clicked.connect(self._on_check_taskid)
@@ -348,15 +442,22 @@ class FtrackInputWidget(QtWidgets.QWidget):
             if aid:
                 self._current_asset_id = str(aid)
         # Копируем уже загруженный список из браузера в основной блок (без API)
-        self._component_name_combo.blockSignals(True)
-        self._component_name_combo.clear()
+        self._component_menu_combo.blockSignals(True)
+        self._component_menu_combo.clear()
         for i in range(self._component_combo.count()):
             label = self._component_combo.itemText(i)
             cid = self._component_combo.itemData(i)
-            self._component_name_combo.addItem(label, cid)
-        self._component_name_combo.setEnabled(True)
-        self._component_name_combo.setCurrentIndex(c_idx)
-        self._component_name_combo.blockSignals(False)
+            self._component_menu_combo.addItem(label, cid)
+        self._component_menu_combo.setEnabled(True)
+        self._component_menu_combo.setCurrentIndex(c_idx)
+        self._component_menu_combo.blockSignals(False)
+        comp_label = self._component_combo.currentText()
+        comp_name = comp_label.split(" (")[0].strip() if comp_label else ""
+        self._current_component_name = comp_name
+        self._component_name_edit.setText(comp_name)
+        self._menus_row.setVisible(True)
+        if self._current_asset_id:
+            self._populate_version_combo_main(str(self._current_asset_id))
         # Как в Houdini: applyCompSelection не вызывает get_component_path; путь — по «get from assetver»
         self._file_path_edit.setText("")
         self._message_label.setText("Selection applied. Click «get from assetver» to resolve path.")
@@ -385,41 +486,263 @@ class FtrackInputWidget(QtWidgets.QWidget):
             if self._transfer_ready:
                 self._message_label.setText(f"Path not local (availability {av:.0f}% at {loc_name}). Use transfer_to_local.")
             elif self._resolved_path:
-                self._message_label.setText("Path resolved.")
+                asset_name = ""
+                comp_name = self._current_component_name or ""
+                if self._current_asset_id and self._current_asset_id in self._asset_cache:
+                    asset_name = self._asset_cache[self._current_asset_id].get("name", "")
+                msg = f"Refreshed: {asset_name} ({comp_name})" if asset_name or comp_name else "Path resolved."
+                self._message_label.setText(msg)
             else:
                 self._message_label.setText(f"No path at {loc_name} (availability {av:.0f}%). Check location or transfer.")
         except Exception as e:
             self._message_label.setText(f"Resolve failed: {e}")
             self._transfer_btn.setEnabled(True)
 
-    def _populate_component_name_combo(self, version_id: str) -> None:
-        """Fill Component Name combo with components for this Asset Version (fast: no path resolution)."""
-        self._component_name_combo.blockSignals(True)
-        self._component_name_combo.clear()
+    def _populate_version_combo_main(self, asset_id: str) -> None:
+        """Build version menu for asset (like Houdini get_data). Uses core when session available."""
+        self._version_combo_main.blockSignals(True)
+        self._version_combo_main.clear()
+        self._version_components_cache.clear()
+        self._version_cached_data = None
         api = self._get_api_client()
-        if not api or not version_id:
-            self._component_name_combo.setEnabled(False)
-            self._component_name_combo.blockSignals(False)
+        if not api or not asset_id:
+            self._version_combo_main.setEnabled(False)
+            self._version_combo_main.blockSignals(False)
             return
         try:
-            components = api.get_components_for_version(version_id)
-            for comp in components:
-                label = comp.get("display_name") or comp.get("name") or comp.get("id")
-                cid = comp.get("id")
-                self._component_name_combo.addItem(label, cid)
-            self._component_name_combo.setEnabled(True)
+            # Prefer core (ftrack_inout.input) when session available
+            try:
+                from ftrack_inout.input.dcc import load_asset_version_data_for_standalone
+                from ftrack_inout.input.core import compute_version_labels_with_indicators
+                cached = load_asset_version_data_for_standalone(api, str(asset_id), force_refresh=False)
+            except ImportError as e:
+                logging.getLogger(__name__).info("Using legacy API (core import failed: %s)", e)
+                cached = None
+            if cached:
+                logging.getLogger(__name__).info("Using core: loaded %d versions for asset %s", len(cached.get("version_info", [])), asset_id)
+                self._version_cached_data = cached
+                version_info = cached.get("version_info", [])
+                current_ver = self._asset_version_edit.text().strip() or self._current_version_id
+                selected_comp_id = self._current_component_id or ""
+                comp_name, comp_ft = self._get_selected_component_name_and_file_type()
+                labels = compute_version_labels_with_indicators(
+                    cached, selected_comp_id, current_ver or "",
+                    selected_comp_name=comp_name or None,
+                    selected_comp_file_type=comp_ft or None,
+                )
+                for i, ver in enumerate(version_info):
+                    label = labels[i] if i < len(labels) else ver.get("name", str(ver.get("id")))
+                    self._version_combo_main.addItem(
+                        label,
+                        {"id": ver["id"], "version": ver.get("version")},
+                    )
+                self._version_combo_main.setEnabled(True)
+                self._menus_row.setVisible(True)
+                if current_ver:
+                    for i in range(self._version_combo_main.count()):
+                        data = self._version_combo_main.itemData(i)
+                        vid = data.get("id") if isinstance(data, dict) else data
+                        if str(vid) == str(current_ver):
+                            self._version_combo_main.setCurrentIndex(i)
+                            break
+            else:
+                logging.getLogger(__name__).info("Using legacy API for asset %s", asset_id)
+                versions = api.get_versions_for_asset(asset_id)
+                current_ver = self._asset_version_edit.text().strip() or self._current_version_id
+                selected_name, selected_ft = self._get_selected_component_name_and_file_type()
+                for v in versions:
+                    vid = v.get("id")
+                    vnum = v.get("version")
+                    comps = api.get_components_for_version(str(vid))
+                    self._version_components_cache[str(vid)] = [
+                        {"name": (c.get("name") or "").strip(), "file_type": (c.get("file_type") or "").replace(".", "").lower()}
+                        for c in comps
+                    ]
+                    label = f"v{vnum:03d}" if vnum is not None else str(vid)
+                    if selected_name and self._version_has_matching_component(str(vid), selected_name, selected_ft):
+                        label += " (*)"
+                    self._version_combo_main.addItem(label, {"id": vid, "version": vnum})
+                self._version_combo_main.setEnabled(True)
+                self._menus_row.setVisible(True)
+                if current_ver:
+                    for i in range(self._version_combo_main.count()):
+                        data = self._version_combo_main.itemData(i)
+                        vid = data.get("id") if isinstance(data, dict) else data
+                        if str(vid) == str(current_ver):
+                            self._version_combo_main.setCurrentIndex(i)
+                            break
         except Exception:
-            self._component_name_combo.setEnabled(False)
-        self._component_name_combo.blockSignals(False)
+            self._version_combo_main.setEnabled(False)
+        self._version_combo_main.blockSignals(False)
 
-    def _on_component_name_combo_changed(self, index: int) -> None:
-        """When user selects another component in list, set Component Id to selected (like applyCompSelection)."""
+    def _get_selected_component_name_and_file_type(self) -> tuple:
+        """Get selected component name and file_type from component menu (for (*) indicator)."""
+        if self._component_menu_combo.currentIndex() < 0:
+            return ("", "")
+        txt = self._component_menu_combo.currentText()
+        if not txt:
+            return ("", "")
+        name = txt.split(" (")[0].strip()
+        ft = ""
+        if " (" in txt and ")" in txt:
+            bracket = txt[txt.index(" (") + 2 : txt.rindex(")")]
+            ft = bracket.replace(".", "").strip().lower()
+        return (name, ft)
+
+    def _version_has_matching_component(self, version_id: str, comp_name: str, comp_file_type: str) -> bool:
+        """Check if version has a component with same name and file_type (for (*) indicator)."""
+        comps = self._version_components_cache.get(version_id, [])
+        for c in comps:
+            cname = (c.get("name") or "").strip().lower()
+            cft = (c.get("file_type") or "").replace(".", "").lower()
+            if cname == comp_name.lower() and cft == comp_file_type:
+                return True
+        return False
+
+    def _update_version_menu_indicators(self) -> None:
+        """Refresh (*) markers in version menu when component selection changes."""
+        if self._version_combo_main.count() == 0:
+            return
+        if self._version_cached_data:
+            try:
+                from ftrack_inout.input.core import compute_version_labels_with_indicators
+                current_ver = self._asset_version_edit.text().strip() or self._current_version_id or ""
+                selected_comp_id = self._current_component_id or ""
+                labels = compute_version_labels_with_indicators(
+                    self._version_cached_data, selected_comp_id, current_ver
+                )
+                for i in range(min(len(labels), self._version_combo_main.count())):
+                    self._version_combo_main.setItemText(i, labels[i])
+            except (ImportError, Exception):
+                pass
+            return
+        if not self._version_components_cache:
+            return
+        selected_name, selected_ft = self._get_selected_component_name_and_file_type()
+        for i in range(self._version_combo_main.count()):
+            data = self._version_combo_main.itemData(i)
+            vid = data.get("id") if isinstance(data, dict) else data
+            vnum = data.get("version") if isinstance(data, dict) else None
+            label = f"v{vnum:03d}" if vnum is not None else str(vid)
+            if selected_name and self._version_has_matching_component(str(vid), selected_name, selected_ft):
+                label += " (*)"
+            self._version_combo_main.setItemText(i, label)
+
+    def _on_version_combo_main_changed(self, index: int) -> None:
+        """User selected another version from main block version menu."""
         if index < 0:
             return
-        cid = self._component_name_combo.itemData(index)
+        data = self._version_combo_main.itemData(index)
+        if not data:
+            return
+        version_id = data.get("id") if isinstance(data, dict) else data
+        if not version_id:
+            return
+        self._asset_version_edit.setText(str(version_id))
+        self._current_version_id = str(version_id)
+        # Capture name+file_type before clear for resolve (same name, prefer same type File vs Sequence)
+        prev_comp_name = self._component_name_edit.text().strip() or None
+        prev_comp_ft = None
+        if self._version_cached_data and self._current_component_id and self._current_version_id:
+            ft_map = self._version_cached_data.get("components_file_types", {}).get(
+                self._current_version_id, {}
+            )
+            prev_comp_ft = ft_map.get(self._current_component_id, "")
+        if prev_comp_ft is None:
+            _, prev_comp_ft = self._get_selected_component_name_and_file_type()
+            prev_comp_ft = prev_comp_ft or None
+        self._component_id_edit.setText("")
+        self._current_component_id = None
+        self._current_component_name = None
+        self._component_name_edit.setText("")
+        self._file_path_edit.setText("")
+        self._populate_component_menu_combo(str(version_id), prev_comp_name=prev_comp_name, prev_comp_file_type=prev_comp_ft)
+        self._message_label.setText("Version changed. Select component, then 'get from assetver'.")
+
+    def _populate_component_menu_combo(
+        self,
+        version_id: str,
+        prev_comp_name: Optional[str] = None,
+        prev_comp_file_type: Optional[str] = None,
+    ) -> None:
+        """Fill Component Name combo with components for this Asset Version. Uses core when cached."""
+        self._component_menu_combo.blockSignals(True)
+        self._component_menu_combo.clear()
+        api = self._get_api_client()
+        if not version_id:
+            self._component_menu_combo.setEnabled(False)
+            self._component_menu_combo.blockSignals(False)
+            return
+        try:
+            # Prefer core cached data when available
+            if self._version_cached_data:
+                try:
+                    from ftrack_inout.input.core import (
+                        get_component_menu_data,
+                        resolve_component_to_select,
+                    )
+                    items, labels = get_component_menu_data(self._version_cached_data, version_id)
+                    comp_name = prev_comp_name or self._component_name_edit.text().strip() or None
+                    to_select = resolve_component_to_select(
+                        self._version_cached_data, version_id,
+                        component_to_select_name=comp_name,
+                        previous_comp_id=self._current_component_id,
+                        component_to_select_file_type=prev_comp_file_type,
+                    )
+                    for item, label in zip(items, labels):
+                        self._component_menu_combo.addItem(label, item)
+                    if to_select and items:
+                        idx = items.index(to_select) if to_select in items else 0
+                        self._component_menu_combo.setCurrentIndex(idx)
+                        # Sync Component Id/Name (signals blocked, so apply manually)
+                        cid = items[idx]
+                        comp_name = labels[idx].split(" (")[0].strip() if labels[idx] else ""
+                        self._component_id_edit.setText(str(cid))
+                        self._current_component_id = str(cid)
+                        self._current_component_name = comp_name
+                        self._component_name_edit.setText(comp_name)
+                except (ImportError, Exception):
+                    pass
+            if self._component_menu_combo.count() == 0 and api:
+                # Fallback: legacy api
+                components = api.get_components_for_version(version_id)
+                for comp in components:
+                    label = comp.get("display_name") or comp.get("name") or comp.get("id")
+                    cid = comp.get("id")
+                    self._component_menu_combo.addItem(label, cid)
+            # Sync Component Id/Name when we have a selection (version switch or initial)
+            if self._component_menu_combo.count() > 0 and self._component_menu_combo.currentIndex() >= 0:
+                idx = self._component_menu_combo.currentIndex()
+                cid = self._component_menu_combo.itemData(idx)
+                if cid:
+                    txt = self._component_menu_combo.itemText(idx)
+                    comp_name = txt.split(" (")[0].strip() if txt else ""
+                    self._component_id_edit.setText(str(cid))
+                    self._current_component_id = str(cid)
+                    self._current_component_name = comp_name
+                    self._component_name_edit.setText(comp_name)
+                    if self._version_cached_data:
+                        self._update_version_menu_indicators()
+            self._component_menu_combo.setEnabled(True)
+            if self._component_menu_combo.count() > 0:
+                self._menus_row.setVisible(True)
+        except Exception:
+            self._component_menu_combo.setEnabled(False)
+        self._component_menu_combo.blockSignals(False)
+
+    def _on_component_menu_combo_changed(self, index: int) -> None:
+        """When user selects component from menu, set Component Id and Component Name (like applyCompSelection)."""
+        if index < 0:
+            return
+        cid = self._component_menu_combo.itemData(index)
         if cid:
+            txt = self._component_menu_combo.currentText()
+            comp_name = txt.split(" (")[0].strip() if txt else None
+            self._current_component_name = comp_name
             self._component_id_edit.setText(str(cid))
             self._current_component_id = str(cid)
+            self._component_name_edit.setText(comp_name or "")
+            self._update_version_menu_indicators()
 
     def _on_get_from_assetver(self) -> None:
         """Component Id has priority. If set: fill Asset Version + Component Name from it, then path. Else: from Version + Component Name combo → Component Id + path."""
@@ -449,16 +772,20 @@ class FtrackInputWidget(QtWidgets.QWidget):
                         "name": info.get("asset_name", ""),
                         "type": info.get("asset_type", ""),
                     }
-                self._populate_component_name_combo(version_id)
+                self._populate_component_menu_combo(version_id)
                 # Select in combo the item matching this component_id
-                for i in range(self._component_name_combo.count()):
-                    if str(self._component_name_combo.itemData(i)) == str(comp_id):
-                        self._component_name_combo.blockSignals(True)
-                        self._component_name_combo.setCurrentIndex(i)
-                        self._component_name_combo.blockSignals(False)
+                for i in range(self._component_menu_combo.count()):
+                    if str(self._component_menu_combo.itemData(i)) == str(comp_id):
+                        self._component_menu_combo.blockSignals(True)
+                        self._component_menu_combo.setCurrentIndex(i)
+                        self._component_menu_combo.blockSignals(False)
                         break
                 self._current_component_id = str(comp_id)
+                self._current_component_name = component_name
+                self._component_name_edit.setText(component_name or "")
                 self._resolve_path_for_current_component()
+                self._populate_version_combo_main(str(self._current_asset_id))
+                self._update_version_menu_indicators()
                 self.selectionResolved.emit(self._build_selection_result())
             except Exception as e:
                 self._message_label.setText(f"Error: {e}")
@@ -470,23 +797,42 @@ class FtrackInputWidget(QtWidgets.QWidget):
         # From Asset Version + Component Name (combo): resolve component_id and path
         self._message_label.setText("Resolving...")
         try:
-            self._populate_component_name_combo(version_id)
-            if self._component_name_combo.count() == 0:
+            # Get asset_id from version for version menu
+            try:
+                session = api.get_session()
+                if session:
+                    av = session.get("AssetVersion", version_id)
+                    if av:
+                        aid = av.get("asset_id")
+                        if not aid and av.get("asset"):
+                            aid = av["asset"].get("id") if hasattr(av["asset"], "get") else None
+                        if aid:
+                            self._current_asset_id = str(aid)
+            except Exception:
+                pass
+            self._populate_component_menu_combo(version_id)
+            if self._component_menu_combo.count() == 0:
                 self._message_label.setText("No components for this version.")
                 return
             # Use current combo selection or first
-            idx = self._component_name_combo.currentIndex()
+            idx = self._component_menu_combo.currentIndex()
             if idx < 0:
                 idx = 0
-                self._component_name_combo.setCurrentIndex(0)
-            cid = self._component_name_combo.itemData(idx)
+                self._component_menu_combo.setCurrentIndex(0)
+            cid = self._component_menu_combo.itemData(idx)
             if not cid:
                 self._message_label.setText("No component selected.")
                 return
+            comp_name = self._component_menu_combo.currentText().split(" (")[0].strip()
             self._component_id_edit.setText(str(cid))
             self._current_version_id = version_id
             self._current_component_id = str(cid)
+            self._current_component_name = comp_name
+            self._component_name_edit.setText(comp_name or "")
             self._resolve_path_for_current_component()
+            if self._current_asset_id:
+                self._populate_version_combo_main(str(self._current_asset_id))
+                self._update_version_menu_indicators()
             self.selectionResolved.emit(self._build_selection_result())
         except Exception as e:
             self._message_label.setText(f"Error: {e}")
@@ -497,13 +843,116 @@ class FtrackInputWidget(QtWidgets.QWidget):
             self.transferRequested.emit(sel)
             self._message_label.setText("Transfer requested.")
 
+    def _on_subscribe_toggled(self, checked: bool) -> None:
+        """Toggle subscription to asset updates (event hub)."""
+        if checked:
+            comp_id = self._component_id_edit.text().strip() or self._current_component_id
+            comp_name = self._current_component_name
+            asset_id = self._current_asset_id
+            if not comp_id or not comp_name or not asset_id:
+                self._subscribe_cb.blockSignals(True)
+                self._subscribe_cb.setChecked(False)
+                self._subscribe_cb.blockSignals(False)
+                self._message_label.setText("Select component first (get from assetver), then subscribe.")
+                return
+            api = self._get_api_client()
+            session = api.get_session() if api else None
+            if not session:
+                self._subscribe_cb.blockSignals(True)
+                self._subscribe_cb.setChecked(False)
+                self._subscribe_cb.blockSignals(False)
+                self._message_label.setText("API/session unavailable.")
+                return
+            try:
+                from .asset_update_listener_standalone import get_listener
+                listener = get_listener(session)
+                if listener:
+                    listener.set_main_thread_dispatcher(
+                        lambda fn: QtCore.QTimer.singleShot(0, fn)
+                    )
+                    self._subscription_key = "widget"
+                    listener.subscribe(
+                        self._subscription_key,
+                        asset_id=str(asset_id),
+                        component_name=str(comp_name),
+                        component_id=str(comp_id),
+                        callback=self._on_pending_update_received,
+                    )
+                    self._message_label.setText(f"Subscribed to updates for {comp_name}.")
+                else:
+                    raise RuntimeError("Listener unavailable")
+            except Exception as e:
+                self._subscribe_cb.blockSignals(True)
+                self._subscribe_cb.setChecked(False)
+                self._subscribe_cb.blockSignals(False)
+                self._message_label.setText(f"Subscribe failed: {e}")
+        else:
+            if self._subscription_key:
+                try:
+                    from .asset_update_listener_standalone import get_listener
+                    listener = get_listener()
+                    if listener:
+                        listener.unsubscribe(self._subscription_key)
+                except Exception:
+                    pass
+                self._subscription_key = None
+            self._pending_update_data = None
+            self._accept_update_btn.setEnabled(False)
+            self._message_label.setText("Unsubscribed.")
+
+    def _on_pending_update_received(self, data: Dict[str, Any]) -> None:
+        """Called when mroya.asset.update-notify matches our component."""
+        self._pending_update_data = data
+        self._accept_update_btn.setEnabled(True)
+        vnum = data.get("version_number", "?")
+        self._message_label.setText(f"Update available: v{vnum}. Click Accept Update.")
+
+    def _on_accept_update(self) -> None:
+        """Apply pending update: switch to new version/component and refresh."""
+        if not self._pending_update_data:
+            self._message_label.setText("No pending update.")
+            return
+        data = self._pending_update_data
+        new_component_id = data.get("component_id")
+        version_id = data.get("version_id")
+        component_name = data.get("component_name", "")
+        version_number = data.get("version_number", "?")
+        if not new_component_id:
+            self._message_label.setText("Invalid pending update data.")
+            return
+        self._asset_version_edit.setText(str(version_id or ""))
+        self._component_id_edit.setText(str(new_component_id))
+        self._current_version_id = str(version_id) if version_id else None
+        self._current_component_id = str(new_component_id)
+        self._current_component_name = component_name
+        self._component_name_edit.setText(component_name or "")
+        self._populate_component_menu_combo(str(version_id)) if version_id else None
+        for i in range(self._component_menu_combo.count()):
+            if str(self._component_menu_combo.itemData(i)) == str(new_component_id):
+                self._component_menu_combo.blockSignals(True)
+                self._component_menu_combo.setCurrentIndex(i)
+                self._component_menu_combo.blockSignals(False)
+                break
+        if self._current_asset_id:
+            self._populate_version_combo_main(str(self._current_asset_id))
+            self._update_version_menu_indicators()
+        self._resolve_path_for_current_component()
+        self._pending_update_data = None
+        self._accept_update_btn.setEnabled(False)
+        self.selectionResolved.emit(self._build_selection_result())
+        self._message_label.setText(f"Updated to v{version_number}. Watching for updates.")
+
     def _build_selection_result(self) -> FtrackComponentSelection:
-        comp_name = None
-        if self._component_name_combo.currentIndex() >= 0:
-            txt = self._component_name_combo.currentText()
+        comp_name = self._current_component_name
+        if comp_name is None and self._component_menu_combo.currentIndex() >= 0:
+            txt = self._component_menu_combo.currentText()
             comp_name = txt.split(" (")[0].strip() if txt else None
         version_number = None
-        if self._version_combo.currentIndex() >= 0:
+        if self._version_combo_main.currentIndex() >= 0:
+            data = self._version_combo_main.itemData(self._version_combo_main.currentIndex())
+            if isinstance(data, dict):
+                version_number = data.get("version")
+        if version_number is None and self._version_combo.currentIndex() >= 0:
             data = self._version_combo.itemData(self._version_combo.currentIndex())
             if isinstance(data, dict):
                 version_number = data.get("version")
