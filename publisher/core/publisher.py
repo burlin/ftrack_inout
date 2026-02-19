@@ -202,28 +202,33 @@ class PublishJob:
 @dataclass
 class PublishResult:
     """Result of publish execution.
-    
+
     Contains information for downstream automation:
     - Success/failure status
     - Created asset version info
     - Component IDs for transfer queue
+    - Timelog info (auto-created on successful publish)
     """
     success: bool
     error_message: Optional[str] = None
-    
+
     # Asset version info (for automation)
     asset_version_id: Optional[str] = None
     asset_version_number: Optional[int] = None
     asset_id: Optional[str] = None
     asset_name: Optional[str] = None
-    
+
     # Component info (for transfer queue)
     component_ids: List[str] = field(default_factory=list)
     component_paths: Dict[str, str] = field(default_factory=dict)  # {comp_id: file_path}
-    
+
     # Detailed info
     created_components: List[dict] = field(default_factory=list)
-    
+
+    # Timelog info (populated when auto-timelog succeeds)
+    timelog_id: Optional[str] = None
+    timelog_seconds: float = 0.0
+
     def to_dict(self) -> dict:
         """Convert to dictionary."""
         return {
@@ -236,6 +241,8 @@ class PublishResult:
             'component_ids': self.component_ids,
             'component_paths': self.component_paths,
             'created_components': self.created_components,
+            'timelog_id': self.timelog_id,
+            'timelog_seconds': self.timelog_seconds,
         }
 
 
@@ -247,12 +254,15 @@ class Publisher:
     - dry_run=False: Actually publishes to Ftrack
     """
     
-    def __init__(self, session=None, dry_run: bool = True):
+    def __init__(self, session=None, dry_run: bool = True, auto_timelog: bool = True):
         """Initialize publisher.
-        
+
         Args:
             session: Ftrack API session (optional; if None, uses shared session with cache)
             dry_run: If True, just print actions without executing
+            auto_timelog: If True, automatically create a timelog on successful publish.
+                Set to False when the caller handles time logging itself (e.g. Maya
+                batch publish with user-editable time dialog).
         """
         if session is None and not dry_run:
             try:
@@ -266,6 +276,7 @@ class Publisher:
                 _log.debug(f"[Publisher] Could not get shared session: {e}")
         self.session = session
         self.dry_run = dry_run
+        self.auto_timelog = auto_timelog
     
     def execute(self, job: PublishJob) -> PublishResult:
         """Execute a publish job.
@@ -597,7 +608,26 @@ class Publisher:
                 _log.debug(f"[Publisher] Cache warm-up (non-critical): {cache_err}")
             
             _log.info(f"[Publisher] Publish complete! Version {version_number}, {len(created_components)} components")
-            
+
+            # ---------------------------------------------------------------
+            # 7. Auto-timelog
+            # ---------------------------------------------------------------
+            timelog_id = None
+            timelog_seconds = 0.0
+            if self.auto_timelog:
+                try:
+                    from ...common.timelog import record_publish, create_ftrack_timelog
+                    per_task_secs, _total_str = record_publish(task_count=1)
+                    timelog_seconds = per_task_secs
+                    timelog_id = create_ftrack_timelog(
+                        session, job.task_id, per_task_secs,
+                        comment="Auto-logged on publish",
+                    )
+                    if timelog_id:
+                        _log.info(f"[Publisher] Timelog created: {timelog_id} ({per_task_secs:.0f}s)")
+                except Exception as tl_err:
+                    _log.warning(f"[Publisher] Auto-timelog failed (non-critical): {tl_err}")
+
             return PublishResult(
                 success=True,
                 asset_version_id=asset_version['id'],
@@ -613,7 +643,9 @@ class Publisher:
                         'id': c.get('id', '')
                     }
                     for c in created_components
-                ]
+                ],
+                timelog_id=timelog_id,
+                timelog_seconds=timelog_seconds,
             )
             
         except Exception as e:

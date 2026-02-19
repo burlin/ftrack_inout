@@ -160,7 +160,7 @@ def create_ftrack_timelog(
     task_id: str,
     seconds: float,
     comment: str = "",
-) -> bool:
+) -> str | None:
     """Create a Timelog entity on the given ftrack task.
 
     Args:
@@ -170,10 +170,10 @@ def create_ftrack_timelog(
         comment: Optional description for the timelog entry.
 
     Returns:
-        True if the timelog was created successfully, False otherwise.
+        The Timelog entity ID if created, or None on failure.
     """
     if session is None or not task_id or seconds <= 0:
-        return False
+        return None
 
     try:
         user = session.query(
@@ -181,9 +181,9 @@ def create_ftrack_timelog(
         ).first()
         if not user:
             logger.error("Could not find ftrack user: %s", session.api_user)
-            return False
+            return None
 
-        session.create("Timelog", {
+        timelog = session.create("Timelog", {
             "user_id": user["id"],
             "context_id": task_id,
             "duration": int(seconds),
@@ -191,10 +191,40 @@ def create_ftrack_timelog(
             "name": comment or "Auto-logged on publish",
         })
         session.commit()
+        timelog_id = timelog["id"]
         logger.info(
-            "Timelog created: %ds on task %s", int(seconds), task_id
+            "Timelog created: %s (%ds on task %s)", timelog_id, int(seconds), task_id
         )
-        return True
+        return timelog_id
     except Exception as exc:
         logger.error("Failed to create timelog: %s", exc)
+        return None
+
+
+def update_ftrack_timelog(session, timelog_id: str, seconds: float) -> bool:
+    """Update the duration of an existing Timelog entity.
+
+    Args:
+        session: An ``ftrack_api.Session`` instance.
+        timelog_id: The Timelog entity ID to update.
+        seconds: New duration in seconds.
+
+    Returns:
+        True if updated successfully, False otherwise.
+    """
+    if session is None or not timelog_id or seconds <= 0:
+        return False
+
+    try:
+        timelog = session.get("Timelog", timelog_id)
+        if not timelog:
+            logger.error("Timelog not found: %s", timelog_id)
+            return False
+
+        timelog["duration"] = int(seconds)
+        session.commit()
+        logger.info("Timelog updated: %s → %ds", timelog_id, int(seconds))
+        return True
+    except Exception as exc:
+        logger.error("Failed to update timelog %s: %s", timelog_id, exc)
         return False
