@@ -579,12 +579,15 @@ def create_node(**kwargs) -> None:
     component_name = component_entity["name"]
     file_format = (component_entity.get("file_type") or "").replace(".", "")
 
-    try:
-        from ftrack_inout.input.core import resolve_component_path
-        session = fu.get_session()
-        component_path = resolve_component_path(session, component_entity) if session else ""
-    except ValueError:
-        component_path = ""
+    # Use path already on node from get_data if present; else resolve
+    component_path = (nu.get_parm_evaluated_string(hda_node, "file_path") or "").strip()
+    if not component_path:
+        try:
+            from ftrack_inout.input.core import resolve_component_path
+            session = fu.get_session()
+            component_path = resolve_component_path(session, component_entity) if session else ""
+        except ValueError:
+            component_path = ""
     if not component_path:
         import hou
         hou.ui.displayMessage("Could not determine file path for component.", title="Ftrack Loader Error")

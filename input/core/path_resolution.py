@@ -57,8 +57,9 @@ def get_primary_disk_location(session: Any) -> Optional[Any]:
     if not disk_locations:
         return None
 
-    # Lower priority value = higher precedence (ftrack convention)
-    disk_locations.sort(key=lambda l: l.get("priority", 999))
+    # Lower priority value = higher precedence (ftrack convention).
+    # priority is an instance attribute (Location.priority), not entity data - use getattr.
+    disk_locations.sort(key=lambda l: getattr(l, "priority", 999))
     return disk_locations[0]
 
 
