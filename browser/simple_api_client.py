@@ -269,11 +269,17 @@ def _add_locations_if_available(session: "ftrack_api.Session") -> None:
 
 class FtrackApiClient:
     """Complete Optimized API Client with efficient caching - from original browser"""
-    
-    def __init__(self, _enable_bulk_preload=True):
+
+    def __init__(self, _enable_bulk_preload=True, session=None):
+        """
+        Args:
+            _enable_bulk_preload: Enable cache preloading.
+            session: Optional ftrack_api.Session. If provided, use shared session
+                (e.g. from get_shared_session) instead of creating a new one.
+        """
         logger.info("[LAUNCH] OPTIMIZED FtrackApiClient starting...")
         self._enable_bulk_preload = _enable_bulk_preload
-        
+
         # Import our optimized components - fixed for Houdini compatibility
         try:
             # Try relative import
@@ -287,10 +293,14 @@ class FtrackApiClient:
             except ImportError as e:
                 logger.warning(f"[WARN] Failed to import CachePreloader: {e}")
                 CachePreloader = None
-        
+
         logger.info("📦 Loading optimized components...")
-        # Create session with cache first
-        self.session = self._create_session_with_cache()
+        # Use provided session (shared session/cache) or create own
+        if session is not None:
+            self.session = session
+            logger.info("[OK] Using provided shared session (cache integration)")
+        else:
+            self.session = self._create_session_with_cache()
         self._preloader = CachePreloader(self.session) if (self.session and CachePreloader) else None
         
         if self._preloader:
