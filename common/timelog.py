@@ -64,6 +64,53 @@ def format_duration(seconds: float) -> str:
     return f"{s}s"
 
 
+def parse_duration(text: str) -> float | None:
+    """Parse a human-readable duration string into seconds.
+
+    Accepted formats:
+        "1h 30m", "1h30m", "2h", "45m", "90" (treated as minutes),
+        "1:30" (h:mm).
+
+    Returns:
+        Total seconds, or None if parsing failed.
+    """
+    import re
+
+    text = text.strip().lower()
+    if not text:
+        return None
+
+    # Try "H:MM" format
+    match = re.match(r'^(\d+):(\d{1,2})$', text)
+    if match:
+        h, m = int(match.group(1)), int(match.group(2))
+        return float(h * 3600 + m * 60)
+
+    # Try "XhYm" / "Xh Ym" / "Xh" / "Ym" combinations
+    hours = 0
+    minutes = 0
+    found = False
+
+    h_match = re.search(r'(\d+)\s*h', text)
+    if h_match:
+        hours = int(h_match.group(1))
+        found = True
+
+    m_match = re.search(r'(\d+)\s*m', text)
+    if m_match:
+        minutes = int(m_match.group(1))
+        found = True
+
+    if found:
+        return float(hours * 3600 + minutes * 60)
+
+    # Plain number — treat as minutes
+    try:
+        return float(int(text) * 60)
+    except ValueError:
+        return None
+
+
 def record_publish(task_count: int = 1) -> tuple[float, str]:
     """Record a publish event and return time information.
 

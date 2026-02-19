@@ -13,7 +13,7 @@ from .path_from_project import (
     get_component_display_path,
     get_asset_display_path_from_component,
 )
-from .timelog import record_publish, create_ftrack_timelog, format_duration
+from .timelog import record_publish, create_ftrack_timelog, format_duration, parse_duration
 
 __all__ = [
     'MemoryCacheWrapper',
@@ -29,4 +29,5 @@ __all__ = [
     'record_publish',
     'create_ftrack_timelog',
     'format_duration',
+    'parse_duration',
 ]
