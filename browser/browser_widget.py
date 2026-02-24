@@ -158,8 +158,10 @@ if PYSIDE6_AVAILABLE:
     class FtrackTaskBrowser(QtWidgets.QWidget):
         """Complete Ftrack Task Browser with exact UI from reference"""
         
-        def __init__(self, parent=None):
+        def __init__(self, parent=None, on_import_to_unreal=None, on_create_handle=None):
             super().__init__(parent)
+            self._on_import_to_unreal = on_import_to_unreal  # optional callback(paths, content_subpath) -> imported count
+            self._on_create_handle = on_create_handle  # optional callback(component_id, content_subpath, asset_version_id) -> asset path or None
             # Always use OptimizedFtrackApiClient - no fallback to basic version
             from .browser_widget_optimized import OptimizedFtrackApiClient
             self.api = OptimizedFtrackApiClient()
@@ -346,13 +348,23 @@ if PYSIDE6_AVAILABLE:
             self.component_list.itemClicked.connect(self.on_component_list_item_selected)
             middle_layout.addWidget(self.component_list)
             
-            # HDA Integration buttons
-            hda_group = QtWidgets.QGroupBox("HDA Integration")
+            # HDA Integration (or Import when launched from Unreal)
+            self._is_unreal_context = (os.environ.get("FTRACK_DCC") == "unreal")
+            hda_group = QtWidgets.QGroupBox("Import" if self._is_unreal_context else "HDA Integration")
             hda_layout = QtWidgets.QVBoxLayout(hda_group)
             
-            self.set_hda_params_btn = QtWidgets.QPushButton("Set Full Params")
-            self.set_hda_params_btn.setToolTip("Set AssetVersionId and ComponentName on selected Ftrack HDA nodes")
-            self.set_hda_params_btn.clicked.connect(self.on_set_hda_params_clicked)
+            if getattr(self, "_on_create_handle", None):
+                self.set_hda_params_btn = QtWidgets.QPushButton("Create Ftrack Handle")
+                self.set_hda_params_btn.setToolTip("Create a Ftrack Asset Handle with the selected component ID and import path. Run import from Window -> Ftrack Resources Control.")
+                self.set_hda_params_btn.clicked.connect(self.on_import_to_unreal_clicked)
+            else:
+                self.set_hda_params_btn = QtWidgets.QPushButton("Import" if self._is_unreal_context else "Set Full Params")
+                if self._is_unreal_context:
+                    self.set_hda_params_btn.setToolTip("Send selected component path to Unreal; then use Ftrack -> Import from Ftrack in Unreal.")
+                    self.set_hda_params_btn.clicked.connect(self.on_import_to_unreal_clicked)
+                else:
+                    self.set_hda_params_btn.setToolTip("Set AssetVersionId and ComponentName on selected Ftrack HDA nodes")
+                    self.set_hda_params_btn.clicked.connect(self.on_set_hda_params_clicked)
             self.set_hda_params_btn.setEnabled(False)
             hda_layout.addWidget(self.set_hda_params_btn)
             
@@ -368,12 +380,20 @@ if PYSIDE6_AVAILABLE:
             self.copy_selected_id_btn.setEnabled(False)
             actions_layout.addWidget(self.copy_selected_id_btn)
 
-            self.load_snapshot_btn = QtWidgets.QPushButton("Load Snapshot") 
+            self.load_snapshot_btn = QtWidgets.QPushButton("Load Snapshot")
             self.load_snapshot_btn.setToolTip("Load selected .hip snapshot component if available")
             self.load_snapshot_btn.clicked.connect(self.on_load_snapshot_button_clicked)
             self.load_snapshot_btn.setEnabled(False)
             actions_layout.addWidget(self.load_snapshot_btn)
-            
+
+            self.import_to_unreal_btn = QtWidgets.QPushButton("Import to Unreal")
+            self.import_to_unreal_btn.setToolTip("Send selected component path to Unreal; then use Ftrack -> Import from Ftrack in Unreal.")
+            self.import_to_unreal_btn.clicked.connect(self.on_import_to_unreal_clicked)
+            self.import_to_unreal_btn.setEnabled(False)
+            # When launched from Unreal, main Import is in HDA group; hide duplicate here
+            if not self._is_unreal_context:
+                actions_layout.addWidget(self.import_to_unreal_btn)
+
             middle_layout.addWidget(actions_group)
 
             # Location Management
@@ -802,9 +822,22 @@ if PYSIDE6_AVAILABLE:
                 if stored_data and stored_data.get('name'):
                     component_selected = True
                 logger.info(f"Component selection: data={stored_data}, selected={component_selected}")
+
+            # Import to Unreal: enable when a component with a valid path is selected (compute early for Unreal branch)
+            import_to_unreal_ok = False
+            if component_selected and current_comp_item:
+                stored_data = current_comp_item.data(QtCore.Qt.UserRole)
+                comp_path = (stored_data or {}).get('path', '') or ''
+                if comp_path and comp_path != 'N/A' and os.path.isfile(comp_path):
+                    import_to_unreal_ok = True
             
-            # HDA Integration buttons - Set Full Params works with any selection
-            self.set_hda_params_btn.setEnabled(asset_version_selected or component_selected)
+            # HDA Integration: Create Ftrack Handle, Set Full Params (Houdini/Maya), or Import (Unreal)
+            if getattr(self, "_on_create_handle", None):
+                self.set_hda_params_btn.setEnabled(component_selected)
+            elif getattr(self, "_is_unreal_context", False):
+                self.set_hda_params_btn.setEnabled(import_to_unreal_ok)
+            else:
+                self.set_hda_params_btn.setEnabled(asset_version_selected or component_selected)
             
             # Right pane buttons
             self.copy_selected_id_btn.setEnabled(asset_version_selected or component_selected)
@@ -818,7 +851,9 @@ if PYSIDE6_AVAILABLE:
                 if comp_path and comp_path.lower().endswith('.hip'):
                     snapshot_loadable = True
             self.load_snapshot_btn.setEnabled(snapshot_loadable)
-            
+
+            self.import_to_unreal_btn.setEnabled(import_to_unreal_ok)
+
             # Location transfer button state
             # NOTE: TRANSFER_ACTION_AVAILABLE check removed - TransferWorker works independently
             # by publishing mroya.transfer.request events. It does NOT require TransferComponentsPlusAction.
@@ -2032,6 +2067,99 @@ if PYSIDE6_AVAILABLE:
             except Exception as e:
                 logger.error(f"Failed to load snapshot: {str(e)}")
                 self.update_status(f"Error loading snapshot: {str(e)}")
+
+        def _get_content_subpath_from_selection(self):
+            """Build Content subpath from ftrack project hierarchy (task tree + asset). E.g. assets/table/rig."""
+            import re
+            segments = []
+            current = self.task_tree.currentItem()
+            while current and current.text(0) != DUMMY_NODE_TEXT:
+                name = current.data(0, ITEM_NAME_ROLE) or current.text(0) or ""
+                if name and name.strip():
+                    # Unreal-friendly: alphanumeric, underscore, hyphen
+                    safe = re.sub(r"[^\w\-]", "_", name.strip()).strip("_") or "unnamed"
+                    segments.append(safe)
+                current = current.parent() if current.parent() else None
+            if not segments:
+                return None
+            segments.reverse()  # project first, then path down
+            # Optionally append asset name from asset version tree
+            av_item = self.asset_version_tree.currentItem()
+            if av_item and av_item.data(0, ASSET_VERSION_ITEM_TYPE_ROLE) == "AssetVersion" and av_item.parent():
+                asset_item = av_item.parent()
+                asset_name = asset_item.text(0) or ""
+                if asset_name:
+                    safe = re.sub(r"[^\w\-]", "_", asset_name.strip()).strip("_") or None
+                    if safe:
+                        segments.append(safe)
+            elif av_item and av_item.data(0, ASSET_VERSION_ITEM_TYPE_ROLE) == "Asset":
+                asset_name = av_item.text(0) or ""
+                if asset_name:
+                    safe = re.sub(r"[^\w\-]", "_", asset_name.strip()).strip("_") or None
+                    if safe:
+                        segments.append(safe)
+            return "/".join(segments) if segments else None
+
+        def on_import_to_unreal_clicked(self):
+            """Create Ftrack Handle (if on_create_handle set) or import into Unreal (if on_import_to_unreal set),
+            or write path to FTRACK_UNREAL_IMPORT_FILE for menu import."""
+            try:
+                current_item = self.component_list.currentItem()
+                if not current_item:
+                    self.update_status("Select a component first.")
+                    return
+                stored_data = current_item.data(QtCore.Qt.UserRole)
+                if not stored_data:
+                    self.update_status("Selected component has no data.")
+                    return
+                component_id = (stored_data.get("id") or "").strip() if isinstance(stored_data.get("id"), (str, type(None))) else str(stored_data.get("id", "")).strip()
+                content_subpath = self._get_content_subpath_from_selection()
+                asset_version_id = None
+                av_item = self.asset_version_tree.currentItem()
+                if av_item and av_item.data(0, ASSET_VERSION_ITEM_TYPE_ROLE) == "AssetVersion":
+                    asset_version_id = av_item.data(0, ASSET_VERSION_ITEM_ID_ROLE)
+                    if asset_version_id is not None:
+                        asset_version_id = str(asset_version_id)
+                if callable(getattr(self, "_on_create_handle", None)):
+                    try:
+                        if not component_id:
+                            self.update_status("Selected component has no ID.")
+                            return
+                        logger.info("Create Ftrack Handle: component_id=%s, content_subpath=%s", component_id[:16] + "...", content_subpath)
+                        path = self._on_create_handle(component_id, content_subpath, asset_version_id)
+                        if path:
+                            self.update_status("Created Ftrack Asset Handle: %s" % path)
+                        else:
+                            self.update_status("Failed to create Ftrack Handle. Check Output Log.")
+                    except Exception as e:
+                        logger.error("Create Ftrack Handle failed: %s", e)
+                        self.update_status("Error creating handle: %s" % e)
+                    return
+                comp_path = (stored_data.get("path") or "").strip()
+                if not comp_path or comp_path == "N/A" or not os.path.isfile(comp_path):
+                    self.update_status("Component path not available or file not found. Ensure component is in a location and path is resolved.")
+                    return
+                path_norm = os.path.normpath(comp_path)
+                if callable(getattr(self, "_on_import_to_unreal", None)):
+                    try:
+                        logger.info("Import to Unreal: calling Unreal import (path=%s, content_subpath=%s)", path_norm[:80], content_subpath)
+                        n = self._on_import_to_unreal([path_norm], content_subpath=content_subpath)
+                        dest = ("/Game/" + content_subpath) if content_subpath else "/Game/FtrackImport"
+                        self.update_status("Imported %s asset(s) to %s." % (n, dest))
+                        logger.info("Import to Unreal (in-process): imported %s -> %s", path_norm, dest)
+                    except Exception as e:
+                        logger.error("Import to Unreal failed: %s", e)
+                        self.update_status("Error importing to Unreal: %s" % e)
+                    return
+                import_file = os.environ.get("FTRACK_UNREAL_IMPORT_FILE", os.path.join(tempfile.gettempdir(), "ftrack_unreal_import.json"))
+                data = {"paths": [path_norm]}
+                with open(import_file, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                self.update_status("Path sent to Unreal. In Unreal use Ftrack -> Import from Ftrack.")
+                logger.info("Import to Unreal: wrote %s to %s", comp_path, import_file)
+            except Exception as e:
+                logger.error("Import to Unreal failed: %s", e)
+                self.update_status("Error sending path to Unreal: %s" % e)
 
         def _refresh_full_tree_with_state(self):
             """Full refresh preserving selection and expansion state"""
