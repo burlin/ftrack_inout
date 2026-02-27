@@ -86,7 +86,8 @@ job = JobBuilder.from_dict({
     'asset_type': 'Geometry',
     'components': [
         {'name': 'main', 'file_path': '/path/to/file.abc', 'component_type': 'file'}
-    ]
+    ],
+    'thumbnail_path': '/path/to/preview.png',  # optional
 })
 
 # From Houdini node (TODO)
@@ -125,6 +126,39 @@ The library is **headless-ready** - UI is just one way to create a `PublishJob`.
 | `snapshot` | Scene archive | Generated during publish |
 | `playblast` | Preview video | Required |
 
+## Thumbnail (Version Preview) — поведение
+
+Версия в ftrack может иметь превью (thumbnail). Варианты:
+
+| Сценарий | Поведение |
+|----------|-----------|
+| **Только playblast** | `encode_media()` создаёт видео и автоматически ставит thumbnail (кадр из видео). |
+| **Только thumbnail_path** | Используйте, когда нет видео (snapshot, геометрия, кэш). `create_thumbnail(path)` задаёт превью. |
+| **Playblast + thumbnail_path** | Сначала playblast даёт auto-thumbnail, затем `create_thumbnail(thumbnail_path)` перезаписывает его. Удобно для кастомного кадра или отдельной картинки. |
+
+Playblast и thumbnail_path **не взаимоисключающие** — можно указать оба.
+
+```python
+# Без playblast — нужен thumbnail_path для превью
+job = PublishJob(
+    task_id='...',
+    asset_name='my_asset',
+    asset_type='Geometry',
+    components=[ComponentData(name='main', file_path='/path/to/cache.abc', component_type='file')],
+    thumbnail_path='/path/to/preview.png',
+)
+
+# С playblast — thumbnail ставится автоматически, thumbnail_path опционален
+job = PublishJob(
+    task_id='...',
+    asset_name='my_asset',
+    components=[
+        ComponentData(name='playblast', file_path='/path/to/video.mp4', component_type='playblast'),
+    ],
+    thumbnail_path='/path/to/custom_frame.png',  # перезапишет auto-thumbnail
+)
+```
+
 ## PublishResult Fields
 
 After `publisher.execute(job)`:
@@ -140,3 +174,15 @@ After `publisher.execute(job)`:
 | `component_paths` | Dict {comp_id: file_path} |
 
 Use `component_ids` for transfer queue integration.
+
+## PublishJob Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `task_id` | str | Ftrack Task ID (required) |
+| `asset_id` | str \| None | Existing Asset ID |
+| `asset_name` | str \| None | Asset name (when creating new) |
+| `asset_type` | str \| None | Asset type (when creating new) |
+| `comment` | str | Version comment |
+| `components` | List[ComponentData] | Components to publish |
+| `thumbnail_path` | str \| None | Optional image for version preview. With playblast: overrides auto-thumbnail. Without: sets preview. |

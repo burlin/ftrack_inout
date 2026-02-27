@@ -95,6 +95,7 @@
 | `use_snapshot` | Toggle | Включить snapshot |
 | `playblast` | String | Путь к playblast |
 | `use_playblast` | Toggle | Включить playblast |
+| `thumbnail_path` | String | Опционально: превью версии. С playblast — перезаписывает auto-thumbnail. Без playblast — задаёт превью. Не взаимоисключающий с playblast. |
 | **`comment`** | String (multiline) | **ДОБАВИТЬ! Комментарий к версии** |
 
 ---

@@ -162,6 +162,7 @@ def _add_publisher_attributes(node: str):
     add_bool_attr("use_snapshot", False)
     add_bool_attr("use_playblast", False)
     add_string_attr("playblast")  # playblast file path
+    add_string_attr("thumbnail_path")  # optional image for version preview (when no playblast)
     
     # Components count
     add_int_attr("components", 0)
@@ -640,6 +641,9 @@ def build_job_from_maya_node(node_name: str) -> 'PublishJob':
     asset_name = get_attr('p_asset_name', '') or None
     asset_type = get_attr('p_asset_type', '') or None
     comment = get_attr('comment', '') or ''
+    thumbnail_path = get_attr('thumbnail_path', '') or None
+    if thumbnail_path:
+        thumbnail_path = str(thumbnail_path).strip() or None
     
     # Get scene path
     source_scene = None
@@ -656,6 +660,7 @@ def build_job_from_maya_node(node_name: str) -> 'PublishJob':
         asset_type=asset_type,
         comment=comment,
         components=components,
+        thumbnail_path=thumbnail_path,
         source_dcc='maya',
         source_scene=source_scene,
     )

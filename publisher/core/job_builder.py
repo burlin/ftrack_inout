@@ -111,6 +111,10 @@ class JobBuilder:
                     ))
         
         # Build PublishJob
+        thumbnail_path = widget.get_parameter('thumbnail_path') or None
+        if thumbnail_path:
+            thumbnail_path = str(thumbnail_path).strip() or None
+        
         job = PublishJob(
             task_id=widget.get_parameter('p_task_id') or '',
             asset_id=widget.get_parameter('p_asset_id') or None,
@@ -118,6 +122,7 @@ class JobBuilder:
             asset_type=widget.get_parameter('p_asset_type') or None,
             comment=widget.get_parameter('comment') or '',
             components=components,
+            thumbnail_path=thumbnail_path,
             source_dcc=source_dcc,
             source_scene=None,  # TODO: get from widget if available
         )

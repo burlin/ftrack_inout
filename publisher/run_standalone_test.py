@@ -44,7 +44,8 @@ def test_dry_run():
         components=[
             ComponentData(name="main.abc", file_path="/tmp/main.abc", component_type="file", export_enabled=True),
             ComponentData(name="beauty.exr", file_path="/tmp/beauty.%04d.exr", component_type="sequence", export_enabled=True),
-        ]
+        ],
+        thumbnail_path="/tmp/preview.png",  # optional: version preview when no playblast
     )
 
     is_valid, errors = job.validate()

@@ -183,6 +183,7 @@ class MayaPublisherWindow(QtWidgets.QDialog):
             'use_snapshot': 'use_snapshot',
             'use_playblast': 'use_playblast',
             'playblast': 'playblast',
+            'thumbnail_path': 'thumbnail_path',
             'components': 'components',
         }
         
@@ -248,6 +249,7 @@ class MayaPublisherWindow(QtWidgets.QDialog):
             'use_snapshot': 'use_snapshot',
             'use_playblast': 'use_playblast',
             'playblast': 'playblast',
+            'thumbnail_path': 'thumbnail_path',
             'components': 'components',
         }
         

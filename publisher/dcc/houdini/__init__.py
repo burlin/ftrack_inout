@@ -418,6 +418,11 @@ def build_job_from_hda(node) -> PublishJob:
     # Comment parameter (may not exist in old HDA versions)
     comment = get_parm('comment') or ''
     
+    # Thumbnail (optional - for versions without playblast)
+    thumbnail_path = get_parm('thumbnail_path') or None
+    if thumbnail_path:
+        thumbnail_path = str(thumbnail_path).strip() or None
+    
     # Build job
     job = PublishJob(
         task_id=task_id,
@@ -426,6 +431,7 @@ def build_job_from_hda(node) -> PublishJob:
         asset_type=asset_type,
         comment=comment,
         components=components,
+        thumbnail_path=thumbnail_path,
         source_dcc='houdini',
         source_scene=source_scene,
     )

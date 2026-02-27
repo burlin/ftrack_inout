@@ -800,6 +800,18 @@ class PublisherWidget(QtWidgets.QWidget):
         self.use_playblast_checkbox.setChecked(False)
         layout.addWidget(self.use_playblast_checkbox)
         
+        # thumbnail_path (optional - for versions without playblast)
+        thumbnail_layout = QtWidgets.QHBoxLayout()
+        thumbnail_layout.addWidget(QtWidgets.QLabel("thumbnail_path:"))
+        self.thumbnail_edit = QtWidgets.QLineEdit()
+        self.thumbnail_edit.setPlaceholderText("Optional: image for preview. With playblast: overrides auto-thumbnail. Without: sets preview.")
+        thumbnail_layout.addWidget(self.thumbnail_edit)
+        browse_thumbnail_btn = QtWidgets.QPushButton("...")
+        browse_thumbnail_btn.setMaximumWidth(30)
+        browse_thumbnail_btn.clicked.connect(self._browse_thumbnail)
+        thumbnail_layout.addWidget(browse_thumbnail_btn)
+        layout.addLayout(thumbnail_layout)
+        
         parent_layout.addWidget(group)
     
     def _create_components_section(self, parent_layout):
@@ -867,6 +879,15 @@ class PublisherWidget(QtWidgets.QWidget):
         )
         if file_path:
             self.playblast_edit.setText(file_path)
+    
+    def _browse_thumbnail(self):
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select Thumbnail Image",
+            self.thumbnail_edit.text() if hasattr(self, 'thumbnail_edit') else "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.tiff *.tif);;All Files (*)"
+        )
+        if file_path and hasattr(self, 'thumbnail_edit'):
+            self.thumbnail_edit.setText(file_path)
     
     # Button handlers - Task Definition logic (based on fselector.py)
     def _on_get_from_env_clicked(self):
@@ -1355,6 +1376,7 @@ class PublisherWidget(QtWidgets.QWidget):
             'use_snapshot': 1 if self.use_snapshot_checkbox.isChecked() else 0,
             'use_playblast': 1 if self.use_playblast_checkbox.isChecked() else 0,
             'playblast': self.playblast_edit.text(),
+            'thumbnail_path': self.thumbnail_edit.text().strip() if hasattr(self, 'thumbnail_edit') else '',
             'components': self.components_spin.value(),
             'comment': self.comment_edit.toPlainText() if hasattr(self, 'comment_edit') else '',
         }
@@ -1444,6 +1466,9 @@ class PublisherWidget(QtWidgets.QWidget):
             self.use_playblast_checkbox.setChecked(value != 0)
         elif name == 'playblast':
             self.playblast_edit.setText(str(value))
+        elif name == 'thumbnail_path':
+            if hasattr(self, 'thumbnail_edit'):
+                self.thumbnail_edit.setText(str(value) if value else '')
         elif name == 'components':
             self.components_spin.setValue(int(value) if value else 0)
         elif name == 'comment':

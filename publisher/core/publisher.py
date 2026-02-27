@@ -84,6 +84,8 @@ class PublishJob:
         asset_type: Asset type (required if creating new asset)
         comment: Version comment
         components: List of components to publish
+        thumbnail_path: Optional path to image for version thumbnail. With playblast: overrides
+            auto-generated thumbnail. Without playblast: sets preview. Not mutually exclusive with playblast.
         source_dcc: Source DCC name ('houdini', 'maya', 'standalone')
         source_scene: Path to source scene file
         created_at: When this job was created
@@ -94,6 +96,7 @@ class PublishJob:
     asset_type: Optional[str] = None
     comment: str = ""
     components: List[ComponentData] = field(default_factory=list)
+    thumbnail_path: Optional[str] = None
     source_dcc: str = "unknown"
     source_scene: Optional[str] = None
     created_at: datetime = field(default_factory=datetime.now)
@@ -165,6 +168,7 @@ class PublishJob:
             'asset_type': self.asset_type,
             'comment': self.comment,
             'components': [c.to_dict() for c in self.components],
+            'thumbnail_path': self.thumbnail_path,
             'source_dcc': self.source_dcc,
             'source_scene': self.source_scene,
             'created_at': self.created_at.isoformat(),
@@ -193,6 +197,7 @@ class PublishJob:
             asset_type=data.get('asset_type'),
             comment=data.get('comment', ''),
             components=components,
+            thumbnail_path=data.get('thumbnail_path'),
             source_dcc=data.get('source_dcc', 'unknown'),
             source_scene=data.get('source_scene'),
             created_at=created_at,
@@ -323,6 +328,7 @@ class Publisher:
         print(f"  Source DCC:   {job.source_dcc}")
         print(f"  Scene:        {job.source_scene or '(not saved)'}")
         print(f"  Comment:      {job.comment or '(no comment)'}")
+        print(f"  Thumbnail:    {job.thumbnail_path or '(none)'}")
         print(f"  Created at:   {job.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
         
         # Components
@@ -365,8 +371,10 @@ class Publisher:
             else:
                 actions.append(f"3.{i}. Create component '{comp.name}' from: {comp.file_path}")
         
-        actions.append(f"4. Update asset metadata index")
-        actions.append(f"5. Commit session")
+        if job.thumbnail_path:
+            actions.append(f"4. Set version thumbnail from: {job.thumbnail_path}")
+        actions.append(f"5. Update asset metadata index")
+        actions.append(f"6. Commit session")
         
         for action in actions:
             print(f"  {action}")
@@ -560,6 +568,24 @@ class Publisher:
                 
                 except Exception as comp_error:
                     _log.error(f"[Publisher] Failed to create component {comp.name}: {comp_error}", exc_info=True)
+            
+            # ---------------------------------------------------------------
+            # 4b. Set Version Thumbnail (optional)
+            # ---------------------------------------------------------------
+            # Playblast via encode_media auto-sets thumbnail. thumbnail_path:
+            # - without playblast: provides preview for versions with no video
+            # - with playblast: overrides the auto-generated thumbnail
+            if job.thumbnail_path:
+                thumb_path = os.path.normpath(job.thumbnail_path)
+                if os.path.exists(thumb_path):
+                    try:
+                        _log.info(f"[Publisher] Setting version thumbnail: {thumb_path}")
+                        asset_version.create_thumbnail(thumb_path)
+                        _log.info("[Publisher] Thumbnail set successfully")
+                    except Exception as thumb_err:
+                        _log.warning(f"[Publisher] Failed to set thumbnail (non-critical): {thumb_err}")
+                else:
+                    _log.warning(f"[Publisher] Thumbnail file not found, skipping: {thumb_path}")
             
             # ---------------------------------------------------------------
             # 5. Update Asset Metadata Index
