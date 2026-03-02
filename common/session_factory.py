@@ -50,40 +50,53 @@ _shared_session: Optional["ftrack_api.Session"] = None
 
 
 def _load_ftrack_env_early() -> None:
-    """Load FTRACK_SERVER, FTRACK_API_KEY, FTRACK_API_USER from .env before session creation.
+    """Load FTRACK_SERVER, FTRACK_API_KEY, FTRACK_API_USER before session creation.
 
-    Tries (in order):
-    - MROYA_FTRACK_CONNECT/config/.env
-    - MROYA_FTRACK_CONNECT/.env
-    - ftrack_inout parent/config/.env (mroya root)
-    - multi-site-location-0.2.0/.env
+    Order:
+    1. Ftrack Connect standard path (%LOCALAPPDATA%\\ftrack\\ftrack-connect\\config.json or credentials.json)
+    2. MROYA_FTRACK_CONNECT/config/.env, .env
+    3. multi-site-location-0.2.0/.env
 
     Only sets variables that are not already in os.environ (does not override).
     """
+    try:
+        from .credentials_loader import load_ftrack_credentials_into_env
+    except ImportError:
+        load_ftrack_credentials_into_env = None
+
+    if load_ftrack_credentials_into_env:
+        mroya_root = os.environ.get("MROYA_FTRACK_CONNECT")
+        if not mroya_root:
+            this_file = Path(__file__).resolve()
+            mroya_root = str(this_file.parent.parent.parent.parent)
+        dotenv_paths = [
+            Path(mroya_root) / "config" / ".env",
+            Path(mroya_root) / ".env",
+        ]
+        try:
+            ftrack_plugins_root = Path(__file__).resolve().parent.parent.parent
+            dotenv_paths.append(ftrack_plugins_root / "multi-site-location-0.2.0" / ".env")
+        except Exception:
+            pass
+        if load_ftrack_credentials_into_env(prefer_connect=True, dotenv_paths=dotenv_paths):
+            return
+
+    # Fallback: dotenv only (if credentials_loader failed or no connect creds)
     if dotenv is None:
         return
-
-    # Paths to try (prefer MROYA_FTRACK_CONNECT)
     mroya_root = os.environ.get("MROYA_FTRACK_CONNECT")
     if not mroya_root:
         this_file = Path(__file__).resolve()
-        # session_factory is in mroya/ftrack_plugins/ftrack_inout/common/
         mroya_root = str(this_file.parent.parent.parent.parent)
-
     candidates = [
         Path(mroya_root) / "config" / ".env",
         Path(mroya_root) / ".env",
     ]
-
-    # Add multi-site plugin .env
     try:
-        this_file = Path(__file__).resolve()
-        ftrack_inout_root = this_file.parent.parent
-        ftrack_plugins_root = ftrack_inout_root.parent
+        ftrack_plugins_root = Path(__file__).resolve().parent.parent.parent
         candidates.append(ftrack_plugins_root / "multi-site-location-0.2.0" / ".env")
     except Exception:
         pass
-
     for env_path in candidates:
         if env_path.is_file():
             try:

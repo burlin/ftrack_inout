@@ -574,7 +574,22 @@ class FtrackApiClient:
         if not FTRACK_API_AVAILABLE:
             logger.error("ftrack_api not available")
             return None
-        
+
+        # Ensure credentials loaded (Ftrack Connect path or .env) if not set
+        if not os.environ.get("FTRACK_SERVER"):
+            try:
+                from ftrack_inout.common.credentials_loader import load_ftrack_credentials_into_env
+                from pathlib import Path
+                this_file = Path(__file__).resolve()
+                mroya_root = str(this_file.parent.parent.parent.parent)
+                dotenv_paths = [
+                    Path(mroya_root) / "config" / ".env",
+                    Path(mroya_root) / ".env",
+                ]
+                load_ftrack_credentials_into_env(prefer_connect=True, dotenv_paths=dotenv_paths)
+            except ImportError:
+                pass
+
         # Use UNIQUE cache path for modular browser to avoid conflicts
         cache_path = os.environ.get('FTRACK_CACHE')
         if not cache_path:

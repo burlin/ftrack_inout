@@ -42,6 +42,7 @@ ftrack-python-api
 # (ftrack_api 2.x uses these; ftrack Connect has its own Python, Unreal does not)
 six>=1.16.0
 appdirs>=1.4.0
+platformdirs>=3.0.0
 pyparsing>=2.0
 
 # S3 accessor для multi-site локаций
