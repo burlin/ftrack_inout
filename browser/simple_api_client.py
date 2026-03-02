@@ -254,10 +254,18 @@ def _add_locations_if_available(session: "ftrack_api.Session") -> None:
         # Register locations into the current ftrack_api.Session immediately.
         s3_location_plugin.session_add_s3_location(session)
 
-        location_setup = user_location_plugin.load_location_config(  # type: ignore[attr-defined]
-            config_path=hook_locations_path / "disk_locations.yaml",
-            user_name=session.api_user,
-        )
+        config_path = user_location_plugin.get_location_config_path()  # type: ignore[attr-defined]
+        try:
+            location_setup = user_location_plugin.load_location_config(  # type: ignore[attr-defined]
+                config_path=config_path,
+                user_name=session.api_user,
+            )
+        except FileNotFoundError:
+            logger.warning(
+                "Location config not found at %s, skipping user locations",
+                config_path
+            )
+            location_setup = {}
         user_location_plugin.session_add_user_location(  # type: ignore[attr-defined]
             session, location_setup
         )
@@ -295,12 +303,21 @@ class FtrackApiClient:
                 CachePreloader = None
 
         logger.info("📦 Loading optimized components...")
-        # Use provided session (shared session/cache) or create own
+        # Use provided session, or shared session, or create own as fallback
         if session is not None:
             self.session = session
             logger.info("[OK] Using provided shared session (cache integration)")
         else:
-            self.session = self._create_session_with_cache()
+            try:
+                from ftrack_inout.common.session_factory import get_shared_session
+                self.session = get_shared_session()
+                if self.session:
+                    logger.info("[OK] Using shared session from session_factory")
+            except Exception as e:
+                logger.debug("get_shared_session failed: %s", e)
+                self.session = None
+            if self.session is None:
+                self.session = self._create_session_with_cache()
         self._preloader = CachePreloader(self.session) if (self.session and CachePreloader) else None
         
         if self._preloader:

@@ -49,6 +49,51 @@ except ImportError:
 _shared_session: Optional["ftrack_api.Session"] = None
 
 
+def _load_ftrack_env_early() -> None:
+    """Load FTRACK_SERVER, FTRACK_API_KEY, FTRACK_API_USER from .env before session creation.
+
+    Tries (in order):
+    - MROYA_FTRACK_CONNECT/config/.env
+    - MROYA_FTRACK_CONNECT/.env
+    - ftrack_inout parent/config/.env (mroya root)
+    - multi-site-location-0.2.0/.env
+
+    Only sets variables that are not already in os.environ (does not override).
+    """
+    if dotenv is None:
+        return
+
+    # Paths to try (prefer MROYA_FTRACK_CONNECT)
+    mroya_root = os.environ.get("MROYA_FTRACK_CONNECT")
+    if not mroya_root:
+        this_file = Path(__file__).resolve()
+        # session_factory is in mroya/ftrack_plugins/ftrack_inout/common/
+        mroya_root = str(this_file.parent.parent.parent.parent)
+
+    candidates = [
+        Path(mroya_root) / "config" / ".env",
+        Path(mroya_root) / ".env",
+    ]
+
+    # Add multi-site plugin .env
+    try:
+        this_file = Path(__file__).resolve()
+        ftrack_inout_root = this_file.parent.parent
+        ftrack_plugins_root = ftrack_inout_root.parent
+        candidates.append(ftrack_plugins_root / "multi-site-location-0.2.0" / ".env")
+    except Exception:
+        pass
+
+    for env_path in candidates:
+        if env_path.is_file():
+            try:
+                dotenv.load_dotenv(env_path)
+                logger.debug("Loaded .env from %s", env_path)
+                return
+            except Exception as e:
+                logger.debug("Failed to load %s: %s", env_path, e)
+
+
 def _add_locations_if_available(session: "ftrack_api.Session") -> None:
     """Register S3 / user locations if multi-site plugin is available.
     
@@ -95,10 +140,18 @@ def _add_locations_if_available(session: "ftrack_api.Session") -> None:
         # Register locations
         s3_location_plugin.session_add_s3_location(session)
 
-        location_setup = user_location_plugin.load_location_config(
-            config_path=hook_locations_path / "disk_locations.yaml",
-            user_name=session.api_user,
-        )
+        config_path = user_location_plugin.get_location_config_path()
+        try:
+            location_setup = user_location_plugin.load_location_config(
+                config_path=config_path,
+                user_name=session.api_user,
+            )
+        except FileNotFoundError:
+            logger.warning(
+                "Location config not found at %s, skipping user locations",
+                config_path
+            )
+            location_setup = {}
         user_location_plugin.session_add_user_location(session, location_setup)
 
         logger.info("Multi-site locations registered successfully")
@@ -220,9 +273,18 @@ def create_shared_session(
     if not FTRACK_API_AVAILABLE:
         logger.error("ftrack_api not available - cannot create session")
         return None
-    
+
+    # Load FTRACK_SERVER, FTRACK_API_KEY, FTRACK_API_USER from .env if not set
+    _load_ftrack_env_early()
+
     log = logger_instance or logger
-    
+
+    if not os.environ.get("FTRACK_SERVER"):
+        log.warning(
+            "FTRACK_SERVER not set. Set FTRACK_SERVER, FTRACK_API_KEY, FTRACK_API_USER "
+            "(env or config/.env) to create a session."
+        )
+
     try:
         log.info("Creating ftrack session with optimized cache...")
         

@@ -38,6 +38,12 @@
 # Ftrack API (часто уже установлен с ftrack Connect)
 ftrack-python-api
 
+# ftrack-api dependencies, needed for Unreal and other embedded Python envs
+# (ftrack_api 2.x uses these; ftrack Connect has its own Python, Unreal does not)
+six>=1.16.0
+appdirs>=1.4.0
+pyparsing>=2.0
+
 # S3 accessor для multi-site локаций
 ftrack-s3-accessor
 
