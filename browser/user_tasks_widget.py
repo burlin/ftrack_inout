@@ -105,7 +105,7 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         layout.setContentsMargins(5, 5, 5, 5)
         layout.setSpacing(4)
 
-        # Toolbar: Project filter + refresh
+        # Toolbar: Project filter + refresh + view mode
         toolbar = QtWidgets.QHBoxLayout()
 
         project_label = QtWidgets.QLabel("Project:", self)
@@ -120,11 +120,28 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         refresh_btn.clicked.connect(self._load_tasks)
         toolbar.addWidget(refresh_btn)
 
+        # View mode: Tree / Board
+        self.view_mode_combo = QtWidgets.QComboBox(self)
+        self.view_mode_combo.addItem("Tree")
+        self.view_mode_combo.addItem("Board")
+        self.view_mode_combo.currentIndexChanged.connect(self._on_view_mode_changed)
+        toolbar.addWidget(self.view_mode_combo)
+
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
 
+        # Main tabs: Tree view and Board view
+        self.tabs = QtWidgets.QTabWidget(self)
+        layout.addWidget(self.tabs, 1)
+
+        # ---------------- Tree page (existing three-pane UI) ----------------
+        tree_page = QtWidgets.QWidget(self.tabs)
+        tree_layout = QtWidgets.QVBoxLayout(tree_page)
+        tree_layout.setContentsMargins(0, 0, 0, 0)
+        tree_layout.setSpacing(4)
+
         # Splitter: left = tasks tree + task actions, middle = files/snapshots, right = linked components
-        splitter = QtWidgets.QSplitter(self)
+        splitter = QtWidgets.QSplitter(tree_page)
 
         # Left pane: tasks tree + task action buttons
         left_widget = QtWidgets.QWidget(splitter)
@@ -137,6 +154,10 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         self.task_tree.setHeaderLabels(
             ["Name", "Project / Context", "Status", "Info"]
         )
+        # Allow sorting by clicking on header columns.
+        # Default order is still defined by _populate_tree (name/context),
+        # but user can change it interactively.
+        self.task_tree.setSortingEnabled(True)
         # Enable tree decoration to show hierarchy as in main browser.
         self.task_tree.setRootIsDecorated(True)
         self.task_tree.setAlternatingRowColors(True)
@@ -173,6 +194,8 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         self.files_tree.setHeaderLabels(
             ["Name", "Size", "Modified", "Path"]
         )
+        # Allow sorting by header click in Task files view.
+        self.files_tree.setSortingEnabled(True)
         self.files_tree.setRootIsDecorated(False)
         self.files_tree.setAlternatingRowColors(True)
         self.files_tree.itemSelectionChanged.connect(self._on_file_selection_changed)
@@ -195,6 +218,8 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         self.snapshots_tree.setHeaderLabels(
             ["Asset", "Version", "Component / Type", "Path", "Available"]
         )
+        # Allow sorting by header click in Published snapshots view.
+        self.snapshots_tree.setSortingEnabled(True)
         self.snapshots_tree.setRootIsDecorated(False)
         self.snapshots_tree.setAlternatingRowColors(True)
         middle_layout.addWidget(self.snapshots_tree, 1)
@@ -238,6 +263,8 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
                 "To transfer",
             ]
         )
+        # Allow sorting by header click in Linked components view.
+        self.linked_tree.setSortingEnabled(True)
         self.linked_tree.setRootIsDecorated(False)
         self.linked_tree.setAlternatingRowColors(True)
         right_layout.addWidget(self.linked_tree, 1)
@@ -262,7 +289,12 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         splitter.setStretchFactor(1, 3)
         splitter.setStretchFactor(2, 2)
 
-        layout.addWidget(splitter, 1)
+        tree_layout.addWidget(splitter, 1)
+
+        self.tabs.addTab(tree_page, "Tree")
+
+        # ---------------- Board page (tasks grouped by status) ----------------
+        self._build_board_page()
 
         # Status label
         self.status_label = QtWidgets.QLabel("Ready", self)
@@ -270,6 +302,32 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
 
         # Connect selection
         self.task_tree.itemSelectionChanged.connect(self._on_task_selection_changed)
+
+        # When user clicks tab directly (not via dropdown), populate that view and sync dropdown
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+    def _build_board_page(self) -> None:
+        """Create Board view page (tasks grouped by status)."""
+        board_page = QtWidgets.QWidget(self.tabs)
+        board_layout = QtWidgets.QVBoxLayout(board_page)
+        board_layout.setContentsMargins(0, 0, 0, 0)
+        board_layout.setSpacing(4)
+
+        scroll = QtWidgets.QScrollArea(board_page)
+        scroll.setWidgetResizable(True)
+
+        container = QtWidgets.QWidget()
+        self.board_layout = QtWidgets.QHBoxLayout(container)
+        self.board_layout.setContentsMargins(4, 4, 4, 4)
+        self.board_layout.setSpacing(8)
+
+        scroll.setWidget(container)
+        board_layout.addWidget(scroll, 1)
+
+        self.board_container = container
+        self._board_lists: Dict[str, QtWidgets.QListWidget] = {}
+
+        self.tabs.addTab(board_page, "Board")
 
     # ------------------------------------------------------------------ Data loading
 
@@ -489,6 +547,85 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         self.task_tree.expandAll()
         self.task_tree.resizeColumnToContents(0)
 
+    # ------------------------------------------------------------------ Board helpers
+
+    def _build_status_groups(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Group tasks by status_name for current project filter."""
+        filtered_tasks = [
+            t
+            for t in self._all_tasks
+            if (not self._current_project_id or t["project_id"] == self._current_project_id)
+        ]
+
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for t in filtered_tasks:
+            status = (t.get("status_name") or "No Status").strip() or "No Status"
+            groups.setdefault(status, []).append(t)
+
+        # Sort tasks inside each status for stable display
+        for status, tasks in groups.items():
+            tasks.sort(
+                key=lambda tt: (
+                    (tt.get("project_name") or "").lower(),
+                    (tt.get("parent_full_name") or "").lower(),
+                    (tt.get("name") or "").lower(),
+                )
+            )
+        return groups
+
+    def _populate_board(self) -> None:
+        """Populate Board view according to current project filter."""
+        if not hasattr(self, "board_layout"):
+            return
+
+        # Clear previous columns
+        while self.board_layout.count():
+            item = self.board_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        self._board_lists = {}
+
+        groups = self._build_status_groups()
+        if not groups:
+            return
+
+        # Deterministic order of statuses
+        statuses = sorted(groups.keys(), key=lambda s: s.lower())
+
+        for status in statuses:
+            column_widget = QtWidgets.QWidget(self.board_container)
+            column_layout = QtWidgets.QVBoxLayout(column_widget)
+            column_layout.setContentsMargins(2, 2, 2, 2)
+            column_layout.setSpacing(4)
+
+            title = QtWidgets.QLabel(f"{status} ({len(groups[status])})", column_widget)
+            title.setStyleSheet("font-weight: bold;")
+            column_layout.addWidget(title)
+
+            list_widget = QtWidgets.QListWidget(column_widget)
+            list_widget.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+            list_widget.itemDoubleClicked.connect(self._on_board_item_double_clicked)
+            list_widget.itemSelectionChanged.connect(
+                lambda lw=list_widget: self._on_board_selection_changed(lw)
+            )
+            column_layout.addWidget(list_widget, 1)
+
+            for task in groups[status]:
+                text = task.get("name") or "<task>"
+                ctx = task.get("parent_full_name") or task.get("project_name") or ""
+                if ctx:
+                    text = f"{text}\n{ctx}"
+                item = QtWidgets.QListWidgetItem(text)
+                item.setData(QtCore.Qt.UserRole, task)  # type: ignore[attr-defined]
+                list_widget.addItem(item)
+
+            self.board_layout.addWidget(column_widget)
+            self._board_lists[status] = list_widget
+
+        self.board_layout.addStretch(1)
+
     # ------------------------------------------------------------------ Slots / helpers
 
     def _on_project_changed(self, index: int) -> None:
@@ -501,6 +638,36 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
                 pass
         self._load_tasks_for_current_project()
 
+    def _on_view_mode_changed(self, index: int) -> None:
+        """Handle switching between Tree and Board views (dropdown)."""
+        if not hasattr(self, "tabs"):
+            return
+        self.tabs.setCurrentIndex(index if 0 <= index < self.tabs.count() else 0)
+        # Re-populate current view using already loaded tasks
+        if self.view_mode_combo.currentText() == "Board":
+            self._populate_board()
+        else:
+            self._populate_tree()
+
+    def _on_tab_changed(self, index: int) -> None:
+        """Handle switching via tab click: populate view and sync dropdown."""
+        if index == 1:
+            # Board tab clicked — fill board and sync dropdown
+            try:
+                self.view_mode_combo.blockSignals(True)
+                self.view_mode_combo.setCurrentIndex(1)
+            finally:
+                self.view_mode_combo.blockSignals(False)
+            self._populate_board()
+        elif index == 0:
+            # Tree tab clicked — fill tree and sync dropdown
+            try:
+                self.view_mode_combo.blockSignals(True)
+                self.view_mode_combo.setCurrentIndex(0)
+            finally:
+                self.view_mode_combo.blockSignals(False)
+            self._populate_tree()
+
     def _on_task_selection_changed(self) -> None:
         """Handle selection change in task tree.
 
@@ -508,6 +675,19 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         Clear right panel, update status and, if task directory already
         exists, show file list. Do not create new folders at this stage.
         """
+        current_item = self.task_tree.currentItem()
+        if not current_item:
+            return
+
+        data = current_item.data(0, QtCore.Qt.UserRole)  # type: ignore[attr-defined]
+        if not isinstance(data, dict):
+            return
+
+        self._on_task_selected(data)
+
+    def _on_task_selected(self, task_data: Dict[str, Any]) -> None:
+        """Common handler when a task is selected (tree or board)."""
+        # Clear right panel
         self.files_tree.clear()
         self.snapshots_tree.clear()
         self.linked_tree.clear()
@@ -518,15 +698,7 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         self.get_snapshots_btn.setEnabled(False)
         self.open_scene_btn.setEnabled(False)
 
-        current_item = self.task_tree.currentItem()
-        if not current_item:
-            return
-
-        data = current_item.data(0, QtCore.Qt.UserRole)  # type: ignore[attr-defined]
-        if not isinstance(data, dict):
-            return
-
-        task_name = data.get("name") or data.get("id") or "<task>"
+        task_name = task_data.get("name") or task_data.get("id") or "<task>"
         self._set_status(f"Selected task: {task_name}")
 
         # Enable actions only for valid task.
@@ -535,7 +707,41 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
 
         # If working root is configured and directory already exists, show files.
         if self._workdir_root:
-            self._populate_task_files_for_data(data, create_if_missing=False)
+            self._populate_task_files_for_data(task_data, create_if_missing=False)
+
+    def _on_board_item_double_clicked(self, item: QtWidgets.QListWidgetItem) -> None:  # type: ignore[misc]
+        """Handle double-click on task in Board view."""
+        data = item.data(QtCore.Qt.UserRole)  # type: ignore[attr-defined]
+        if not isinstance(data, dict):
+            return
+
+        # Select task and switch to Tree view to show details / files / snapshots.
+        self._on_task_selected(data)
+
+        task_id = data.get("id")
+        if task_id:
+            try:
+                self.view_mode_combo.setCurrentText("Tree")
+            except Exception:
+                pass
+            # Ensure tree is populated and try to focus corresponding task.
+            self._populate_tree()
+            self._select_task_in_tree_by_id(str(task_id))
+
+    def _on_board_selection_changed(self, source_list: QtWidgets.QListWidget) -> None:  # type: ignore[misc]
+        """Ensure only one task is selected across all Board columns."""
+        if not hasattr(self, "_board_lists"):
+            return
+        # If nothing is selected in this list, nothing to do.
+        if not source_list.selectedItems():
+            return
+
+        for lw in self._board_lists.values():
+            if lw is source_list:
+                continue
+            lw.blockSignals(True)
+            lw.clearSelection()
+            lw.blockSignals(False)
 
     # ------------------------------------------------------------------ Per-project task loading
 
@@ -623,11 +829,15 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
             time.perf_counter() - t_transform_start,
         )
 
-        t_tree_start = time.perf_counter()
-        self._populate_tree()
+        # Populate current view (Tree or Board)
+        t_view_start = time.perf_counter()
+        if hasattr(self, "view_mode_combo") and self.view_mode_combo.currentText() == "Board":
+            self._populate_board()
+        else:
+            self._populate_tree()
         logger.info(
-            "UserTasksWidget: _populate_tree took %.3f s",
-            time.perf_counter() - t_tree_start,
+            "UserTasksWidget: task view populate took %.3f s",
+            time.perf_counter() - t_view_start,
         )
 
     def _maybe_focus_initial_task(self) -> None:

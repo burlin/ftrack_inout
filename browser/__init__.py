@@ -120,7 +120,9 @@ def get_migration_progress():
 def createInterface():
     """Entry point for Houdini Python Panel - maintains compatibility"""
     if FtrackBrowser:
-        return FtrackBrowser()
+        # Explicitly pass DCC identifier so browser can apply per-DCC behavior
+        # (e.g. component visibility masks based on file_type).
+        return FtrackBrowser(dcc="houdini")
     else:
         # Fallback to embedded version during migration
         raise ImportError(

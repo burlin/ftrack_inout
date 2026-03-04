@@ -21,3 +21,37 @@ project_filter:
   enabled: true
   statuses:
     - "Active"
+
+# Per-DCC component visibility masks for the main browser (Task Browser / Input).
+#
+# Keys under component_filters are DCC identifiers (lowercase),
+# e.g. "houdini", "maya", "blender", "ue5", plus optional "default"/"all" group.
+# Values:
+#   hide_file_types:    list of file types to completely hide from component list
+#   disabled_file_types: list of file types to show but make not selectable (greyed-out)
+#
+# File types come from ftrack Component.file_type and are compared
+# case-insensitively and without leading dot, e.g.:
+#   "abc", "ma", "mb", "hip", "usd", "vdb"
+#
+# Example (all masks below are EMPTY by default and do not change behavior
+# until you uncomment and fill them for your pipeline):
+#
+# component_filters:
+#   default:
+#     hide_file_types: []
+#     disabled_file_types: []
+#   houdini:
+#     hide_file_types: ["ma", "mb"]          # Hide Maya scenes in Houdini browser
+#     disabled_file_types: []                # Show but disable certain types if needed
+#   maya:
+#     hide_file_types: ["hip", "hiplc"]      # Hide Houdini scenes in Maya browser
+#     disabled_file_types: []
+#   blender:
+#     hide_file_types: []
+#     disabled_file_types: []
+#   ue5:
+#     hide_file_types: []
+#     disabled_file_types: []
+
+component_filters: {}

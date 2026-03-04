@@ -157,11 +157,22 @@ MIGRATION_STATUS = {
 if PYSIDE6_AVAILABLE:
     class FtrackTaskBrowser(QtWidgets.QWidget):
         """Complete Ftrack Task Browser with exact UI from reference"""
-        
-        def __init__(self, parent=None, on_import_to_unreal=None, on_create_handle=None):
+
+        def __init__(self, parent=None, on_import_to_unreal=None, on_create_handle=None, dcc=None):
             super().__init__(parent)
             self._on_import_to_unreal = on_import_to_unreal  # optional callback(paths, content_subpath) -> imported count
             self._on_create_handle = on_create_handle  # optional callback(component_id, content_subpath, asset_version_id) -> asset path or None
+
+            # Remember DCC context for component filtering and other behavior tweaks.
+            # Default to "houdini" as this browser is primarily used there.
+            self._dcc = (str(dcc) if dcc is not None else "houdini").strip().lower() or "houdini"
+
+            # Per-user settings (used for UI-level overrides, e.g. component filters)
+            try:
+                self._settings = QtCore.QSettings("mroya", "FtrackBrowser")
+            except Exception:
+                self._settings = None
+
             # Always use OptimizedFtrackApiClient - no fallback to basic version
             from .browser_widget_optimized import OptimizedFtrackApiClient
             self.api = OptimizedFtrackApiClient()
@@ -170,26 +181,30 @@ if PYSIDE6_AVAILABLE:
             self.current_task_filter_id = None  # NEW: Store task ID for filtering versions
             self.selected_item = None
             self.pending_item_data = None
-            
+
             # Cache for optimized loading
             self._entity_assets_cache = {}
-            
+
             # Load HDA parameter configuration
             self._load_hda_param_config()
-            
+
+            # Load per-DCC component visibility masks (pipeline config + optional user overrides)
+            self._component_filters = {"hide_file_types": set(), "disabled_file_types": set()}
+            self._reload_component_filters()
+
             # Timer for delayed selection processing
             self.selection_timer = QtCore.QTimer()
             self.selection_timer.setSingleShot(True)
             self.selection_timer.timeout.connect(self.on_selection_timer_timeout)
-            
+
             # Create UI first (like in original)
             self._create_complete_ui()
-            
+
             # Load projects and locations (like in original)
             self.projects = []
             self.load_projects()
             self._load_locations()
-            
+
             # Connect signals
             self.task_tree.itemSelectionChanged.connect(self.on_item_selected)
             self.task_tree.itemExpanded.connect(self.on_item_expanded)
@@ -340,16 +355,28 @@ if PYSIDE6_AVAILABLE:
             middle_column = QtWidgets.QWidget()
             middle_layout = QtWidgets.QVBoxLayout(middle_column)
             middle_layout.setContentsMargins(0,0,0,0)
-            
+
+            # Components header row: label + settings button for per-DCC filters
+            components_header_layout = QtWidgets.QHBoxLayout()
             components_label = QtWidgets.QLabel("Components:")
-            middle_layout.addWidget(components_label)
-            
+            components_header_layout.addWidget(components_label)
+
+            self.components_filter_btn = QtWidgets.QToolButton()
+            self.components_filter_btn.setText("⋯")
+            self.components_filter_btn.setToolTip("Configure component filters for this DCC (hide / disable by file type)")
+            self.components_filter_btn.clicked.connect(self.on_component_filters_button_clicked)
+
+            # Label on the left, filter button aligned to the right.
+            components_header_layout.addStretch(1)
+            components_header_layout.addWidget(self.components_filter_btn)
+            middle_layout.addLayout(components_header_layout)
+
             self.component_list = QtWidgets.QListWidget()
             self.component_list.itemClicked.connect(self.on_component_list_item_selected)
             middle_layout.addWidget(self.component_list)
             
             # HDA Integration (or Import when launched from Unreal)
-            self._is_unreal_context = (os.environ.get("FTRACK_DCC") == "unreal")
+            self._is_unreal_context = (self._dcc == "unreal")
             hda_group = QtWidgets.QGroupBox("Import" if self._is_unreal_context else "HDA Integration")
             hda_layout = QtWidgets.QVBoxLayout(hda_group)
             
@@ -1529,8 +1556,22 @@ if PYSIDE6_AVAILABLE:
                 components = sorted(components, key=lambda x: x.get('name', '').lower())
 
                 self.component_list.clear()
-                
+
+                # Pre-resolve per-DCC visibility masks (effective filters)
+                hide_types = set(self._component_filters.get("hide_file_types") or [])
+                disabled_types = set(self._component_filters.get("disabled_file_types") or [])
+
+                def _normalize_file_type_local(ft):
+                    return (ft or "").replace(".", "").strip().lower()
+
                 for comp_data in components:
+                    file_type = comp_data.get('file_type', '') or ''
+                    ft_norm = _normalize_file_type_local(file_type)
+
+                    # Apply "hide" mask: component is not shown at all.
+                    if ft_norm and ft_norm in hide_types:
+                        continue
+
                     display_name = comp_data.get('display_name', comp_data.get('name', 'Unknown'))
                     list_item = QtWidgets.QListWidgetItem(display_name)
                     
@@ -1538,10 +1579,23 @@ if PYSIDE6_AVAILABLE:
                         'id': comp_data.get('id'),
                         'path': comp_data.get('path', 'N/A'),
                         'name': comp_data.get('name'),
-                        'type': comp_data.get('file_type', ''),
+                        'type': file_type,
                         'locations': comp_data.get('locations', []) # Pass locations to widget data
                     }
                     list_item.setData(QtCore.Qt.UserRole, stored_data)
+
+                    # Apply "disabled" mask: show but make item not selectable/active.
+                    if ft_norm and ft_norm in disabled_types:
+                        list_item.setFlags(list_item.flags() & ~QtCore.Qt.ItemIsEnabled)
+                        # Slightly grey-out text to indicate disabled state.
+                        try:
+                            disabled_color = QtGui.QColor(160, 160, 160)
+                            list_item.setForeground(QtGui.QBrush(disabled_color))
+                            if self._dcc:
+                                list_item.setToolTip(f"Component type '{file_type}' is not available in {self._dcc}.")
+                        except Exception:
+                            pass
+
                     self.component_list.addItem(list_item)
                 
                 components_end_time = time_module.time()
@@ -1599,6 +1653,14 @@ if PYSIDE6_AVAILABLE:
             current = self.component_list.currentItem()
             if current is not None:
                 self.on_component_list_item_selected(current)
+
+        def on_component_filters_button_clicked(self):
+            """Open dialog to configure per-DCC component visibility filters."""
+            try:
+                self._show_component_filters_dialog()
+            except Exception as e:
+                logger.error(f"Error opening component filters dialog: {e}", exc_info=True)
+                self.update_status("Error opening component filters dialog.")
             
         def on_copy_id_button_clicked(self):
             """Copy selected item ID to clipboard"""
@@ -2549,6 +2611,135 @@ if PYSIDE6_AVAILABLE:
                 logger.error(f"Failed to load HDA param config: {e}", exc_info=True)
                 self.update_status("Error loading HDA config.")
 
+        def _reload_component_filters(self):
+            """Load effective component filters for current DCC (config + optional user overrides)."""
+            # Base filters from pipeline-level config (browser_config.yaml)
+            base_filters = {"hide_file_types": set(), "disabled_file_types": set()}
+            try:
+                from .browser_config_loader import get_component_filters_for_dcc
+                base_filters = get_component_filters_for_dcc(self._dcc)
+            except Exception:
+                base_filters = {"hide_file_types": set(), "disabled_file_types": set()}
+
+            effective_filters = {
+                "hide_file_types": set(base_filters.get("hide_file_types") or []),
+                "disabled_file_types": set(base_filters.get("disabled_file_types") or []),
+            }
+
+            # Apply per-user overrides from QSettings (if present).
+            # If user defined any lists for this DCC, they REPLACE pipeline lists.
+            try:
+                if getattr(self, "_settings", None) is not None:
+                    prefix = f"component_filters/{self._dcc}"
+                    user_hide = self._settings.value(f"{prefix}/hide_file_types", [], type=list)  # type: ignore[arg-type]
+                    user_disabled = self._settings.value(f"{prefix}/disabled_file_types", [], type=list)  # type: ignore[arg-type]
+
+                    def _normalize_list(values):
+                        result = set()
+                        for v in values or []:
+                            ft = (str(v) or "").replace(".", "").strip().lower()
+                            if ft:
+                                result.add(ft)
+                        return result
+
+                    if user_hide or user_disabled:
+                        effective_filters["hide_file_types"] = _normalize_list(user_hide)
+                        effective_filters["disabled_file_types"] = _normalize_list(user_disabled)
+            except Exception as e:
+                logger.error(f"Failed to apply user component filter overrides: {e}", exc_info=True)
+
+            self._component_filters = effective_filters
+
+        def _show_component_filters_dialog(self):
+            """Show simple dialog to edit component filters for current DCC."""
+            if QtWidgets is None:
+                return
+
+            # Ensure filters are up to date before showing dialog
+            self._reload_component_filters()
+
+            hide_types = sorted(self._component_filters.get("hide_file_types") or [])
+            disabled_types = sorted(self._component_filters.get("disabled_file_types") or [])
+
+            dlg = QtWidgets.QDialog(self)
+            dlg.setWindowTitle(f"Component Filters ({self._dcc})")
+            dlg.setModal(True)
+
+            layout = QtWidgets.QVBoxLayout(dlg)
+
+            info_label = QtWidgets.QLabel(
+                "Configure which component file types are hidden or shown as disabled\n"
+                f"for current DCC: <b>{self._dcc}</b>.\n"
+                "Enter extensions without dot, separated by commas (e.g. ma, mb, abc)."
+            )
+            info_label.setWordWrap(True)
+            layout.addWidget(info_label)
+
+            # Hide types
+            hide_row = QtWidgets.QHBoxLayout()
+            hide_label = QtWidgets.QLabel("Hide types:", dlg)
+            hide_row.addWidget(hide_label)
+            hide_edit = QtWidgets.QLineEdit(dlg)
+            hide_edit.setText(", ".join(hide_types))
+            hide_row.addWidget(hide_edit, 1)
+            layout.addLayout(hide_row)
+
+            # Disabled types
+            disabled_row = QtWidgets.QHBoxLayout()
+            disabled_label = QtWidgets.QLabel("Disabled types:", dlg)
+            disabled_row.addWidget(disabled_label)
+            disabled_edit = QtWidgets.QLineEdit(dlg)
+            disabled_edit.setText(", ".join(disabled_types))
+            disabled_row.addWidget(disabled_edit, 1)
+            layout.addLayout(disabled_row)
+
+            # Buttons
+            buttons = QtWidgets.QDialogButtonBox(
+                QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+                parent=dlg,
+            )
+            layout.addWidget(buttons)
+
+            def _on_accept():
+                try:
+                    def _parse(text):
+                        raw = (text or "").replace(";", ",")
+                        items = [t.strip() for t in raw.split(",") if t.strip()]
+                        result = []
+                        seen = set()
+                        for token in items:
+                            ft = token.replace(".", "").strip().lower()
+                            if ft and ft not in seen:
+                                seen.add(ft)
+                                result.append(ft)
+                        return result
+
+                    new_hide = _parse(hide_edit.text())
+                    new_disabled = _parse(disabled_edit.text())
+
+                    if getattr(self, "_settings", None) is not None:
+                        prefix = f"component_filters/{self._dcc}"
+                        self._settings.setValue(f"{prefix}/hide_file_types", new_hide)
+                        self._settings.setValue(f"{prefix}/disabled_file_types", new_disabled)
+
+                    # Reload filters and re-apply to current components list (if any version is selected)
+                    self._reload_component_filters()
+
+                    current_asset_item = self.asset_version_tree.currentItem()
+                    if current_asset_item and current_asset_item.data(0, ASSET_VERSION_ITEM_TYPE_ROLE) == "AssetVersion":
+                        version_id = current_asset_item.data(0, ASSET_VERSION_ITEM_ID_ROLE)
+                        if version_id:
+                            # Do not force refresh paths; just re-query and re-populate list with new filters.
+                            self.load_components_for_version(version_id, force_refresh=False)
+                except Exception as exc:
+                    logger.error(f"Failed to save component filters: {exc}", exc_info=True)
+                    self.update_status("Error saving component filters.")
+
+            buttons.accepted.connect(_on_accept)
+            buttons.rejected.connect(dlg.reject)
+
+            dlg.exec_()
+
         def on_start_transfer_clicked(self):
             """Handle start transfer button click."""
             logger.info("browser_widget.on_start_transfer_clicked: Transfer button clicked")
@@ -3059,8 +3250,13 @@ class TransferWorker(QtCore.QRunnable):
             logger.info("TransferWorker.run: Emitting finished signal and exiting worker thread")
             self.signals.finished.emit()
 
-def show():
-    """Show browser in a PySide2 application."""
+def show(dcc=None):
+    """Show browser in a PySide application.
+
+    Args:
+        dcc: Optional DCC identifier (e.g. "houdini", "maya", "blender", "ue5", "standalone").
+             If not provided, FtrackTaskBrowser will apply its internal default.
+    """
     if not PYSIDE6_AVAILABLE:
         logger.error("PySide6 not available, can't show browser.")
         return
@@ -3069,7 +3265,7 @@ def show():
     if not app:
         app = QtWidgets.QApplication(sys.argv)
         
-    browser = FtrackTaskBrowser()
+    browser = FtrackTaskBrowser(dcc=dcc)
     browser.show()
     
     # Start event loop if not already running
@@ -3093,9 +3289,14 @@ else:
     # Global factory function
     _global_browser_instance = None
     
-    def create_browser_widget():
-        """Factory function to create a single instance of the browser."""
+    def create_browser_widget(parent=None, dcc=None):
+        """Factory function to create a single instance of the browser.
+
+        Args:
+            parent: Optional Qt parent for the browser widget.
+            dcc: Optional DCC identifier (e.g. "houdini", "maya", "blender", "ue5").
+        """
         global _global_browser_instance
         if _global_browser_instance is None:
-            _global_browser_instance = FtrackTaskBrowser()
+            _global_browser_instance = FtrackTaskBrowser(parent=parent, dcc=dcc)
         return _global_browser_instance

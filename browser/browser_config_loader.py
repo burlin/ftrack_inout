@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import yaml
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Iterable, Set
 
 _CACHE: dict[str, Any] | None = None
 
@@ -22,6 +22,7 @@ DEFAULTS = {
         "enabled": True,
         "statuses": ["Active"],
     },
+    "component_filters": {},  # per-DCC component visibility masks
 }
 
 
@@ -44,6 +45,9 @@ def get_browser_config() -> dict[str, Any]:
                         result["project_filter"]["enabled"] = bool(pf["enabled"])
                     if "statuses" in pf and isinstance(pf["statuses"], list):
                         result["project_filter"]["statuses"] = [str(s) for s in pf["statuses"]]
+                if "component_filters" in data and isinstance(data["component_filters"], dict):
+                    # Store as-is; normalization is handled in helper functions.
+                    result["component_filters"] = data["component_filters"]
         except Exception:
             pass
     _CACHE = result
@@ -65,3 +69,65 @@ def get_project_filter_statuses() -> list[str] | None:
     if not statuses:
         return None
     return [str(s) for s in statuses]
+
+
+def _normalize_file_type(ft: str) -> str:
+    """Normalize file_type / extension for comparison (no dot, lowercase)."""
+    return (ft or "").replace(".", "").strip().lower()
+
+
+def _normalize_type_list(values: Iterable[Any]) -> Set[str]:
+    """Normalize a list of file type values to a set of normalized strings."""
+    normalized: Set[str] = set()
+    for v in values or []:
+        ft = _normalize_file_type(str(v))
+        if ft:
+            normalized.add(ft)
+    return normalized
+
+
+def get_component_filters_for_dcc(dcc: str) -> Dict[str, Set[str]]:
+    """Return component visibility masks (hide/disable) for given DCC.
+
+    The browser_config.yaml may define:
+
+    component_filters:
+      default:
+        hide_file_types: [ma, mb]
+        disabled_file_types: [abc]
+      houdini:
+        hide_file_types: [ma, mb]
+        disabled_file_types: [abc]
+      maya:
+        hide_file_types: [hip]
+
+    Resolution rules:
+    - Start with empty sets.
+    - Apply "default"/"all"/* group if present.
+    - Overlay DCC-specific group (key is lowercased dcc string).
+    """
+    cfg = get_browser_config()
+    filters_cfg = cfg.get("component_filters") or {}
+    hide: Set[str] = set()
+    disabled: Set[str] = set()
+
+    if isinstance(filters_cfg, dict):
+        # Global/default groups
+        for key in ("default", "all", "*"):
+            group = filters_cfg.get(key)
+            if isinstance(group, dict):
+                hide.update(_normalize_type_list(group.get("hide_file_types") or []))
+                disabled.update(_normalize_type_list(group.get("disabled_file_types") or []))
+
+        # DCC-specific overrides
+        dcc_key = str(dcc or "").strip().lower()
+        if dcc_key:
+            group = filters_cfg.get(dcc_key)
+            if isinstance(group, dict):
+                hide.update(_normalize_type_list(group.get("hide_file_types") or []))
+                disabled.update(_normalize_type_list(group.get("disabled_file_types") or []))
+
+    return {
+        "hide_file_types": hide,
+        "disabled_file_types": disabled,
+    }

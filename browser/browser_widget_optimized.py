@@ -1825,17 +1825,21 @@ class OptimizedFtrackApiClient:
 # browser_widget.py now uses OptimizedFtrackApiClient directly.
 # Kept for backward compatibility with old code, but not used in current architecture.
 
-def create_optimized_browser_widget():
+def create_optimized_browser_widget(*args, **kwargs):
     """DEPRECATED: browser_widget.py now uses OptimizedFtrackApiClient directly.
-    This function is kept for backward compatibility only."""
+    This function is kept for backward compatibility only.
+
+    Accepts arbitrary args/kwargs and forwards them to FtrackTaskBrowser,
+    so newer code can pass DCC identifier and parent explicitly.
+    """
     logger.warning("[DEPRECATED] create_optimized_browser_widget() is deprecated. Use FtrackTaskBrowser from browser_widget.py directly.")
     from .browser_widget import FtrackTaskBrowser
-    return FtrackTaskBrowser()
+    return FtrackTaskBrowser(*args, **kwargs)
 
 # For backward compatibility
-def create_browser_widget():
+def create_browser_widget(*args, **kwargs):
     """DEPRECATED: Backward compatibility function"""
-    return create_optimized_browser_widget()
+    return create_optimized_browser_widget(*args, **kwargs)
 
 # DEPRECATED: Use FtrackTaskBrowser from browser_widget.py directly
 class OptimizedFtrackBrowser:
