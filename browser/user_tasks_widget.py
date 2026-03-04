@@ -68,6 +68,7 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         parent: Optional[QtWidgets.QWidget] = None,  # type: ignore[name-defined]
         api_client: Optional[SimpleFtrackApiClient] = None,
         dcc_handlers: Optional[UserTasksDccHandlers] = None,
+        initial_task_id: Optional[str] = None,
     ) -> None:
         if QtWidgets is None:  # pragma: no cover - defensive path
             raise RuntimeError("PySide6 is not available; UserTasksWidget cannot be created.")
@@ -82,9 +83,12 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         self._active_projects: Dict[str, str] = {}
         self._current_project_id: Optional[str] = None
         self._api_user: Optional[str] = None
-        # Initial task from DCC context (e.g., FTRACK_CONTEXTID),
-        # to focus on it when launching from a scene.
-        self._initial_task_id: Optional[str] = os.environ.get("FTRACK_CONTEXTID") or None
+        # Initial task context, used to focus specific task on launch.
+        # Prefer explicit argument (e.g., from CLI --task-id), fall back to
+        # FTRACK_CONTEXTID environment variable for DCC integrations.
+        self._initial_task_id: Optional[str] = (
+            str(initial_task_id).strip() if initial_task_id else None
+        ) or os.environ.get("FTRACK_CONTEXTID") or None
         # Root of project working directory, used for building paths
         # to scenes for tasks.
         self._workdir_root = os.environ.get("FTRACK_WORKDIR") or None
@@ -94,6 +98,16 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
 
         # Lazy initialization of target locations list for linked component transfer.
         self._transfer_locations_initialized: bool = False
+
+        # Optional status filter for Board view (normalized lowercase status names).
+        # None means show all statuses; a non-empty set filters to specific ones.
+        # By default show only "In progress" column when no explicit task is provided.
+        default_board_status = "in progress"
+        self._board_filter_statuses: Optional[set[str]] = {default_board_status}
+        # When widget is launched with specific task context, Board filter will be
+        # refined to that task status in _maybe_focus_initial_task.
+        if self._initial_task_id:
+            self._board_filter_statuses = None
 
         self._build_ui()
         self._load_tasks()
@@ -130,26 +144,27 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
 
-        # Main tabs: Tree view and Board view
-        self.tabs = QtWidgets.QTabWidget(self)
-        layout.addWidget(self.tabs, 1)
+        # Main splitter: left = tasks (Tree / Board) + actions,
+        # middle = files/snapshots, right = linked components.
+        splitter = QtWidgets.QSplitter(self)
+        layout.addWidget(splitter, 1)
 
-        # ---------------- Tree page (existing three-pane UI) ----------------
-        tree_page = QtWidgets.QWidget(self.tabs)
-        tree_layout = QtWidgets.QVBoxLayout(tree_page)
-        tree_layout.setContentsMargins(0, 0, 0, 0)
-        tree_layout.setSpacing(4)
-
-        # Splitter: left = tasks tree + task actions, middle = files/snapshots, right = linked components
-        splitter = QtWidgets.QSplitter(tree_page)
-
-        # Left pane: tasks tree + task action buttons
+        # Left pane: stacked task views (Tree / Board) + task action buttons.
         left_widget = QtWidgets.QWidget(splitter)
         left_layout = QtWidgets.QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(4)
 
-        self.task_tree = QtWidgets.QTreeWidget(left_widget)
+        # Stacked widget with alternative task views.
+        self.task_view_stack = QtWidgets.QStackedWidget(left_widget)
+
+        # ---- Tree view page (existing three-pane UI left side) ----
+        tree_view_page = QtWidgets.QWidget(self.task_view_stack)
+        tree_view_layout = QtWidgets.QVBoxLayout(tree_view_page)
+        tree_view_layout.setContentsMargins(0, 0, 0, 0)
+        tree_view_layout.setSpacing(0)
+
+        self.task_tree = QtWidgets.QTreeWidget(tree_view_page)
         self.task_tree.setColumnCount(4)
         self.task_tree.setHeaderLabels(
             ["Name", "Project / Context", "Status", "Info"]
@@ -162,8 +177,12 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         self.task_tree.setRootIsDecorated(True)
         self.task_tree.setAlternatingRowColors(True)
         self.task_tree.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        left_layout.addWidget(self.task_tree, 1)
+        tree_view_layout.addWidget(self.task_tree, 1)
 
+        self.task_view_stack.addWidget(tree_view_page)
+        left_layout.addWidget(self.task_view_stack, 1)
+
+        # Task action buttons (shared for both Tree and Board selections).
         task_btn_bar = QtWidgets.QHBoxLayout()
         task_btn_bar.addStretch(1)
         self.create_scene_btn = QtWidgets.QPushButton("Create Task Scene", left_widget)
@@ -289,26 +308,32 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         splitter.setStretchFactor(1, 3)
         splitter.setStretchFactor(2, 2)
 
-        tree_layout.addWidget(splitter, 1)
-
-        self.tabs.addTab(tree_page, "Tree")
-
         # ---------------- Board page (tasks grouped by status) ----------------
+        # Board view lives in the same left pane as the tree, using the stacked widget.
         self._build_board_page()
+
+        # Default view is Board: it becomes the primary task selection surface.
+        try:
+            self.view_mode_combo.blockSignals(True)
+            if self.view_mode_combo.count() > 1:
+                # Index 1 corresponds to "Board".
+                self.view_mode_combo.setCurrentIndex(1)
+                # Switch stacked view to Board (index 1).
+                if self.task_view_stack.count() > 1:
+                    self.task_view_stack.setCurrentIndex(1)
+        finally:
+            self.view_mode_combo.blockSignals(False)
 
         # Status label
         self.status_label = QtWidgets.QLabel("Ready", self)
         layout.addWidget(self.status_label)
 
-        # Connect selection
+        # Connect selection from tree view
         self.task_tree.itemSelectionChanged.connect(self._on_task_selection_changed)
 
-        # When user clicks tab directly (not via dropdown), populate that view and sync dropdown
-        self.tabs.currentChanged.connect(self._on_tab_changed)
-
     def _build_board_page(self) -> None:
-        """Create Board view page (tasks grouped by status)."""
-        board_page = QtWidgets.QWidget(self.tabs)
+        """Create Board view page (tasks grouped by status) inside task view stack."""
+        board_page = QtWidgets.QWidget(self.task_view_stack)
         board_layout = QtWidgets.QVBoxLayout(board_page)
         board_layout.setContentsMargins(0, 0, 0, 0)
         board_layout.setSpacing(4)
@@ -326,8 +351,7 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
 
         self.board_container = container
         self._board_lists: Dict[str, QtWidgets.QListWidget] = {}
-
-        self.tabs.addTab(board_page, "Board")
+        self.task_view_stack.addWidget(board_page)
 
     # ------------------------------------------------------------------ Data loading
 
@@ -591,10 +615,22 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         if not groups:
             return
 
+        # Optional status filter for Board view (e.g. only "In progress").
+        filter_set: Optional[set[str]] = None
+        if self._board_filter_statuses:
+            filter_set = {
+                s.strip().lower() for s in self._board_filter_statuses if s and s.strip()
+            }
+
         # Deterministic order of statuses
         statuses = sorted(groups.keys(), key=lambda s: s.lower())
 
         for status in statuses:
+            if filter_set is not None:
+                norm_status = (status or "").strip().lower()
+                if norm_status not in filter_set:
+                    continue
+
             column_widget = QtWidgets.QWidget(self.board_container)
             column_layout = QtWidgets.QVBoxLayout(column_widget)
             column_layout.setContentsMargins(2, 2, 2, 2)
@@ -640,11 +676,15 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
 
     def _on_view_mode_changed(self, index: int) -> None:
         """Handle switching between Tree and Board views (dropdown)."""
-        if not hasattr(self, "tabs"):
+        if not hasattr(self, "task_view_stack"):
             return
-        self.tabs.setCurrentIndex(index if 0 <= index < self.tabs.count() else 0)
+        # Determine target view based on combo text: 0 = Tree, 1 = Board.
+        use_board = self.view_mode_combo.currentText() == "Board"
+        target_index = 1 if use_board else 0
+        if 0 <= target_index < self.task_view_stack.count():
+            self.task_view_stack.setCurrentIndex(target_index)
         # Re-populate current view using already loaded tasks
-        if self.view_mode_combo.currentText() == "Board":
+        if use_board:
             self._populate_board()
         else:
             self._populate_tree()
@@ -736,12 +776,21 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         if not source_list.selectedItems():
             return
 
+        # Clear selection in all other lists to keep exactly one selected task.
         for lw in self._board_lists.values():
             if lw is source_list:
                 continue
             lw.blockSignals(True)
             lw.clearSelection()
             lw.blockSignals(False)
+
+        # Use the currently selected item as the active task and update details pane.
+        current = source_list.currentItem()
+        if current is None:
+            return
+        data = current.data(QtCore.Qt.UserRole)  # type: ignore[attr-defined]
+        if isinstance(data, dict):
+            self._on_task_selected(data)
 
     # ------------------------------------------------------------------ Per-project task loading
 
@@ -901,11 +950,50 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
             self._set_project_combo_to_current()
             self._load_tasks_for_current_project()
 
-        # Tree is already built, try to find and select needed task.
-        if self._select_task_in_tree_by_id(task_id):
-            logger.info(
-                "UserTasksWidget: auto-selected task %s from initial context id", task_id
-            )
+        # After (re)loading tasks for the correct project, try to find the task
+        # in the loaded list and adjust Board/Tree views accordingly.
+        found_task = None
+        for t in self._all_tasks:
+            if str(t.get("id")) == task_id:
+                found_task = t
+                break
+
+        if found_task is not None:
+            status_name = (found_task.get("status_name") or "No Status").strip() or "No Status"
+            norm_status = status_name.lower()
+
+            # Refine Board filter to only the status of initial task so board shows
+            # the lane that contains this task.
+            self._board_filter_statuses = {norm_status} if norm_status else None
+
+            # Make Board the active view and repopulate it with the refined filter.
+            try:
+                if hasattr(self, "view_mode_combo"):
+                    self.view_mode_combo.blockSignals(True)
+                    if self.view_mode_combo.count() > 1:
+                        # Index 1 corresponds to "Board".
+                        self.view_mode_combo.setCurrentIndex(1)
+                        if hasattr(self, "task_view_stack") and self.task_view_stack.count() > 1:
+                            self.task_view_stack.setCurrentIndex(1)
+            finally:
+                if hasattr(self, "view_mode_combo"):
+                    self.view_mode_combo.blockSignals(False)
+
+            self._populate_board()
+            if self._select_task_in_board_by_id(task_id):
+                logger.info(
+                    "UserTasksWidget: auto-selected task %s in Board view from initial context id",
+                    task_id,
+                )
+
+            # Also populate Tree and select the same task there so that when user
+            # switches to Tree view, the selection and context are consistent.
+            self._populate_tree()
+            if self._select_task_in_tree_by_id(task_id):
+                logger.info(
+                    "UserTasksWidget: auto-selected task %s in Tree view from initial context id",
+                    task_id,
+                )
         else:
             # Task exists (we were able to get it and project), but is not
             # in current user's task selection. Show regular task list
@@ -942,6 +1030,27 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
             child = item.child(i)
             if self._select_task_in_subtree(child, task_id):
                 return True
+        return False
+
+    def _select_task_in_board_by_id(self, task_id: str) -> bool:
+        """Find and select task in Board view by id. Returns True if successful."""
+        if not hasattr(self, "_board_lists"):
+            return False
+        for lw in self._board_lists.values():
+            if lw is None:
+                continue
+            for row in range(lw.count()):
+                item = lw.item(row)
+                if item is None:
+                    continue
+                data = item.data(QtCore.Qt.UserRole)  # type: ignore[attr-defined]
+                if isinstance(data, dict) and str(data.get("id")) == task_id:
+                    lw.setCurrentItem(item)
+                    try:
+                        lw.scrollToItem(item)
+                    except Exception:
+                        pass
+                    return True
         return False
 
     # ------------------------------------------------------------------ Snapshot loading

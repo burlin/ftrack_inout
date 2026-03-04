@@ -206,7 +206,11 @@ if PYSIDE6_AVAILABLE:
             self._load_locations()
 
             # Connect signals
-            self.task_tree.itemSelectionChanged.connect(self.on_item_selected)
+            # itemSelectionChanged in Qt does not pass item/column arguments,
+            # so use a small wrapper instead of connecting directly to
+            # on_item_selected(item, column). This is important for ftrack
+            # Connect environment where itemSelectionChanged is emitted.
+            self.task_tree.itemSelectionChanged.connect(self.on_task_selection_changed)
             self.task_tree.itemExpanded.connect(self.on_item_expanded)
             self.asset_version_tree.itemSelectionChanged.connect(self.on_asset_version_selection_changed)
             self.asset_version_tree.itemExpanded.connect(self.on_asset_item_expanded)
@@ -283,7 +287,7 @@ if PYSIDE6_AVAILABLE:
             self.change_focus_btn = QtWidgets.QPushButton("Change focus")
             self.change_focus_btn.setToolTip("Focus browser on component from selected Houdini node (componentid)")
             self.change_focus_btn.clicked.connect(self.on_change_focus_clicked)
-            self.change_focus_btn.setVisible(HOUDINI_AVAILABLE)
+            self.change_focus_btn.setVisible(HOUDINI_AVAILABLE and self._dcc != "connect")
             toolbar_layout.addWidget(self.change_focus_btn)
 
             # Main splitter
@@ -316,18 +320,21 @@ if PYSIDE6_AVAILABLE:
             )
             self.scene_setup_btn.clicked.connect(self.on_scene_setup_button_clicked)
             self.scene_setup_btn.setEnabled(False)
+            self.scene_setup_btn.setVisible(self._dcc != "connect")
             action_button_layout.addWidget(self.scene_setup_btn)
             
             self.set_task_btn = QtWidgets.QPushButton("Set Task")
             self.set_task_btn.setToolTip("Set FTRACK_CONTEXTID from selected task")
             self.set_task_btn.clicked.connect(self.on_set_task_button_clicked)
             self.set_task_btn.setEnabled(False)
+            # Keep Set Task visible in Connect, it only manipulates context.
             action_button_layout.addWidget(self.set_task_btn)
             
             self.set_task_on_node_btn = QtWidgets.QPushButton("Set Task on Sel. Node")
             self.set_task_on_node_btn.setToolTip("Set task_Id parameter on selected nodes")
             self.set_task_on_node_btn.clicked.connect(self.on_set_task_on_node_clicked)
             self.set_task_on_node_btn.setEnabled(False)
+            self.set_task_on_node_btn.setVisible(self._dcc != "connect")
             action_button_layout.addWidget(self.set_task_on_node_btn)
             
             left_layout.addLayout(action_button_layout)
@@ -377,51 +384,61 @@ if PYSIDE6_AVAILABLE:
             
             # HDA Integration (or Import when launched from Unreal)
             self._is_unreal_context = (self._dcc == "unreal")
-            hda_group = QtWidgets.QGroupBox("Import" if self._is_unreal_context else "HDA Integration")
-            hda_layout = QtWidgets.QVBoxLayout(hda_group)
-            
-            if getattr(self, "_on_create_handle", None):
-                self.set_hda_params_btn = QtWidgets.QPushButton("Create Ftrack Handle")
-                self.set_hda_params_btn.setToolTip("Create a Ftrack Asset Handle with the selected component ID and import path. Run import from Window -> Ftrack Resources Control.")
-                self.set_hda_params_btn.clicked.connect(self.on_import_to_unreal_clicked)
+            if self._dcc == "connect":
+                # In ftrack Connect context do not create or show HDA controls at all.
+                # Keep attributes for button state code but set them to None.
+                self.set_hda_params_btn = None
             else:
-                self.set_hda_params_btn = QtWidgets.QPushButton("Import" if self._is_unreal_context else "Set Full Params")
-                if self._is_unreal_context:
-                    self.set_hda_params_btn.setToolTip("Send selected component path to Unreal; then use Ftrack -> Import from Ftrack in Unreal.")
+                hda_group = QtWidgets.QGroupBox("Import" if self._is_unreal_context else "HDA Integration")
+                hda_layout = QtWidgets.QVBoxLayout(hda_group)
+                
+                if getattr(self, "_on_create_handle", None):
+                    self.set_hda_params_btn = QtWidgets.QPushButton("Create Ftrack Handle")
+                    self.set_hda_params_btn.setToolTip("Create a Ftrack Asset Handle with the selected component ID and import path. Run import from Window -> Ftrack Resources Control.")
                     self.set_hda_params_btn.clicked.connect(self.on_import_to_unreal_clicked)
                 else:
-                    self.set_hda_params_btn.setToolTip("Set AssetVersionId and ComponentName on selected Ftrack HDA nodes")
-                    self.set_hda_params_btn.clicked.connect(self.on_set_hda_params_clicked)
-            self.set_hda_params_btn.setEnabled(False)
-            hda_layout.addWidget(self.set_hda_params_btn)
-            
-            middle_layout.addWidget(hda_group)
+                    self.set_hda_params_btn = QtWidgets.QPushButton("Import" if self._is_unreal_context else "Set Full Params")
+                    if self._is_unreal_context:
+                        self.set_hda_params_btn.setToolTip("Send selected component path to Unreal; then use Ftrack -> Import from Ftrack in Unreal.")
+                        self.set_hda_params_btn.clicked.connect(self.on_import_to_unreal_clicked)
+                    else:
+                        self.set_hda_params_btn.setToolTip("Set AssetVersionId and ComponentName on selected Ftrack HDA nodes")
+                        self.set_hda_params_btn.clicked.connect(self.on_set_hda_params_clicked)
+                self.set_hda_params_btn.setEnabled(False)
+                hda_layout.addWidget(self.set_hda_params_btn)
+                middle_layout.addWidget(hda_group)
             
             # Other action buttons
-            actions_group = QtWidgets.QGroupBox("Actions")
-            actions_layout = QtWidgets.QVBoxLayout(actions_group)
-            
-            self.copy_selected_id_btn = QtWidgets.QPushButton("Copy Sel. ID")
-            self.copy_selected_id_btn.setToolTip("Copy ID of selected component or asset version")
-            self.copy_selected_id_btn.clicked.connect(self.on_copy_selected_id_button_clicked)
-            self.copy_selected_id_btn.setEnabled(False)
-            actions_layout.addWidget(self.copy_selected_id_btn)
+            if self._dcc == "connect":
+                # In ftrack Connect context we do not show or create Actions group buttons.
+                self.copy_selected_id_btn = None
+                self.load_snapshot_btn = None
+                self.import_to_unreal_btn = None
+            else:
+                actions_group = QtWidgets.QGroupBox("Actions")
+                actions_layout = QtWidgets.QVBoxLayout(actions_group)
+                
+                self.copy_selected_id_btn = QtWidgets.QPushButton("Copy Sel. ID")
+                self.copy_selected_id_btn.setToolTip("Copy ID of selected component or asset version")
+                self.copy_selected_id_btn.clicked.connect(self.on_copy_selected_id_button_clicked)
+                self.copy_selected_id_btn.setEnabled(False)
+                actions_layout.addWidget(self.copy_selected_id_btn)
 
-            self.load_snapshot_btn = QtWidgets.QPushButton("Load Snapshot")
-            self.load_snapshot_btn.setToolTip("Load selected .hip snapshot component if available")
-            self.load_snapshot_btn.clicked.connect(self.on_load_snapshot_button_clicked)
-            self.load_snapshot_btn.setEnabled(False)
-            actions_layout.addWidget(self.load_snapshot_btn)
+                self.load_snapshot_btn = QtWidgets.QPushButton("Load Snapshot")
+                self.load_snapshot_btn.setToolTip("Load selected .hip snapshot component if available")
+                self.load_snapshot_btn.clicked.connect(self.on_load_snapshot_button_clicked)
+                self.load_snapshot_btn.setEnabled(False)
+                actions_layout.addWidget(self.load_snapshot_btn)
 
-            self.import_to_unreal_btn = QtWidgets.QPushButton("Import to Unreal")
-            self.import_to_unreal_btn.setToolTip("Send selected component path to Unreal; then use Ftrack -> Import from Ftrack in Unreal.")
-            self.import_to_unreal_btn.clicked.connect(self.on_import_to_unreal_clicked)
-            self.import_to_unreal_btn.setEnabled(False)
-            # When launched from Unreal, main Import is in HDA group; hide duplicate here
-            if not self._is_unreal_context:
-                actions_layout.addWidget(self.import_to_unreal_btn)
+                self.import_to_unreal_btn = QtWidgets.QPushButton("Import to Unreal")
+                self.import_to_unreal_btn.setToolTip("Send selected component path to Unreal; then use Ftrack -> Import from Ftrack in Unreal.")
+                self.import_to_unreal_btn.clicked.connect(self.on_import_to_unreal_clicked)
+                self.import_to_unreal_btn.setEnabled(False)
+                # When launched from Unreal, main Import is in HDA group; hide duplicate here.
+                if not self._is_unreal_context:
+                    actions_layout.addWidget(self.import_to_unreal_btn)
 
-            middle_layout.addWidget(actions_group)
+                middle_layout.addWidget(actions_group)
 
             # Location Management
             location_group = QtWidgets.QGroupBox("Location Management")
@@ -859,15 +876,17 @@ if PYSIDE6_AVAILABLE:
                     import_to_unreal_ok = True
             
             # HDA Integration: Create Ftrack Handle, Set Full Params (Houdini/Maya), or Import (Unreal)
-            if getattr(self, "_on_create_handle", None):
-                self.set_hda_params_btn.setEnabled(component_selected)
-            elif getattr(self, "_is_unreal_context", False):
-                self.set_hda_params_btn.setEnabled(import_to_unreal_ok)
-            else:
-                self.set_hda_params_btn.setEnabled(asset_version_selected or component_selected)
+            if getattr(self, "set_hda_params_btn", None) is not None:
+                if getattr(self, "_on_create_handle", None):
+                    self.set_hda_params_btn.setEnabled(component_selected)
+                elif getattr(self, "_is_unreal_context", False):
+                    self.set_hda_params_btn.setEnabled(import_to_unreal_ok)
+                else:
+                    self.set_hda_params_btn.setEnabled(asset_version_selected or component_selected)
             
             # Right pane buttons
-            self.copy_selected_id_btn.setEnabled(asset_version_selected or component_selected)
+            if getattr(self, "copy_selected_id_btn", None) is not None:
+                self.copy_selected_id_btn.setEnabled(asset_version_selected or component_selected)
             logger.info(f"Button states updated: copy_selected_id={asset_version_selected or component_selected}, hda_params={asset_version_selected or component_selected}")
             
             # Load Snapshot button - only enable for .hip components
@@ -877,9 +896,11 @@ if PYSIDE6_AVAILABLE:
                 comp_path = stored_data.get('path', '')
                 if comp_path and comp_path.lower().endswith('.hip'):
                     snapshot_loadable = True
-            self.load_snapshot_btn.setEnabled(snapshot_loadable)
+            if getattr(self, "load_snapshot_btn", None) is not None:
+                self.load_snapshot_btn.setEnabled(snapshot_loadable)
 
-            self.import_to_unreal_btn.setEnabled(import_to_unreal_ok)
+            if getattr(self, "import_to_unreal_btn", None) is not None:
+                self.import_to_unreal_btn.setEnabled(import_to_unreal_ok)
 
             # Location transfer button state
             # NOTE: TRANSFER_ACTION_AVAILABLE check removed - TransferWorker works independently
@@ -1047,6 +1068,16 @@ if PYSIDE6_AVAILABLE:
 
                 item.addChild(QtWidgets.QTreeWidgetItem([DUMMY_NODE_TEXT]))
                 parent_item.addChild(item)
+
+        def on_task_selection_changed(self):
+            """Qt slot for itemSelectionChanged signal (no-argument signature)."""
+            try:
+                current_item = self.task_tree.currentItem()
+                if current_item is not None:
+                    # Column 0 contains the main label and custom roles.
+                    self.on_item_selected(current_item, 0)
+            except Exception as e:  # pragma: no cover - defensive path
+                logger.error("Error in on_task_selection_changed: %s", e, exc_info=True)
 
         def on_item_selected(self, item, column):
             """Handle tree item selection"""
