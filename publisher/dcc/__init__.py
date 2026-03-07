@@ -26,6 +26,7 @@ def get_houdini_bridge():
         publish_callback,
         publish_dry_run_callback,
         get_target_node,
+        get_transfer_target_location_menu_items,
     )
     return {
         'HoudiniParameterInterface': HoudiniParameterInterface,
@@ -33,6 +34,7 @@ def get_houdini_bridge():
         'publish_callback': publish_callback,
         'publish_dry_run_callback': publish_dry_run_callback,
         'get_target_node': get_target_node,
+        'get_transfer_target_location_menu_items': get_transfer_target_location_menu_items,
     }
 
 

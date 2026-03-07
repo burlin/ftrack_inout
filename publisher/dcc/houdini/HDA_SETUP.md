@@ -97,6 +97,18 @@
 | `use_playblast` | Toggle | Включить playblast |
 | `thumbnail_path` | String | Опционально: превью версии. С playblast — перезаписывает auto-thumbnail. Без playblast — задаёт превью. Не взаимоисключающий с playblast. |
 | **`comment`** | String (multiline) | **ДОБАВИТЬ! Комментарий к версии** |
+| **`transfer_target_location`** | Menu (script) | Целевая локация для transfer after publish. Меню заполняется скриптом (см. ниже). Значение = location id или "" для «без трансфера». |
+
+### Меню локаций (transfer_target_location)
+
+Параметр типа **Menu** с **Use Menu Script** = Python. В **Menu Script** укажите:
+
+```python
+from ftrack_inout.publisher.dcc.houdini import get_transfer_target_location_menu_items
+return get_transfer_target_location_menu_items()
+```
+
+Скрипт возвращает список `[(label, value), ...]`: «(no transfer)» с value `""`, затем локации с accessor (label = label/name, value = location id). При отсутствии сессии Ftrack в меню только «(no transfer)».
 
 ---
 
@@ -106,6 +118,7 @@
 |---------------|------|-------------|
 | `components` | Folder (TabbedMultiparmBlock) | Количество компонентов |
 | `export#` | Toggle | Экспортировать компонент |
+| `transfer_after_publish#` | Toggle | После публикации создать transfer job в целевую локацию (по умолчанию 1). Учитывается только если задан `transfer_target_location`. |
 | `comp_name#` | String | Имя компонента |
 | `file_path#` | String | Путь к файлу |
 | `meta_count#` | Folder (MultiparmBlock) | Количество метаданных |

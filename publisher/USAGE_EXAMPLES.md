@@ -90,12 +90,66 @@ job = JobBuilder.from_dict({
     'thumbnail_path': '/path/to/preview.png',  # optional
 })
 
-# From Houdini node (TODO)
-job = JobBuilder.from_houdini_node(hou.node('/out/fpublish1'))
+# From Houdini HDA node
+job = JobBuilder.from_houdini_node(hou.node('/out/publish1'))
 
-# From Maya node (TODO)
+# From Maya node
 job = JobBuilder.from_maya_node('mroya_publisher1')
 ```
+
+## 6. Transfer after publish
+
+If `PublishJob.transfer_target_location` is set (location id or name), after publishing the publisher creates transfer jobs for each published component that has `transfer_after_publish=True` (snapshot always; playblast never; file components per-tab/HDA toggle).
+
+```python
+from ftrack_inout.publisher.core import JobBuilder, Publisher
+
+job = JobBuilder.from_qt_widget(widget, source_dcc="standalone")
+# job.transfer_target_location is set from widget "Target location" dropdown (location id or "")
+
+# Or when building job manually:
+job = PublishJob(
+    task_id="...",
+    asset_name="my_asset",
+    components=[
+        ComponentData(name="main", file_path="/path/file.abc", transfer_after_publish=True),
+        ComponentData(name="playblast", file_path="/path/video.mp4", component_type="playblast", transfer_after_publish=False),
+    ],
+    transfer_target_location="6c73a09a-0931-450a-b824-260c9f79eb37",  # or location name
+)
+publisher = Publisher(session=session)
+result = publisher.execute(job)
+# Step 8: for each component with transfer_after_publish=True, a transfer job is created to the target location
+```
+
+## 7. Locations list for dropdowns (get_locations_with_accessor)
+
+Use one procedure to get locations suitable for "Target location" dropdown in UI or in Houdini/Maya menu scripts. Returns a **list of dicts** (not a single dict); each item describes one location.
+
+```python
+from ftrack_inout.publisher.core import get_locations_with_accessor
+
+# Requires a valid Ftrack session
+locations = get_locations_with_accessor(session)
+# Returns: list of dicts
+# [
+#   {"id": "uuid-...", "name": "s3.studio.storage", "label": "S3 Studio Storage", "location_type": "s3"},
+#   {"id": "uuid-...", "name": "burlin.local", "label": "burlin.local", "location_type": "disk"},
+#   ...
+# ]
+# - id: Ftrack Location id (use as stored value in dropdown)
+# - name: Location name
+# - label: Display label (label or name)
+# - location_type: "s3" | "disk" | "unknown"
+# Sorted by label/name. System locations (ftrack.origin, ftrack.connect, etc.) are excluded.
+# Only locations that have an accessor (real storage) are included.
+```
+
+**Standalone Qt:** The publisher widget calls `get_locations_with_accessor(self._session)` in `_populate_transfer_target_locations()` to fill the "Target location" combo.
+
+**Houdini:** Use in the publish HDA Menu Script for parameter `transfer_target_location`; see `ftrack_inout.publisher.dcc.houdini.get_transfer_target_location_menu_items()` which uses this function and returns `[token1, label1, token2, label2, ...]` for Houdini.
+
+**Maya:** Same contract: call `get_locations_with_accessor(session)` when building your target-location dropdown.
 
 ## Architecture
 
@@ -186,3 +240,10 @@ Use `component_ids` for transfer queue integration.
 | `comment` | str | Version comment |
 | `components` | List[ComponentData] | Components to publish |
 | `thumbnail_path` | str \| None | Optional image for version preview. With playblast: overrides auto-thumbnail. Without: sets preview. |
+| `transfer_target_location` | str \| None | Target location id or name for transfer after publish. If set, step 8 creates transfer jobs for components with `transfer_after_publish=True`. Empty/None = no transfer. |
+
+## ComponentData: transfer_after_publish
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `transfer_after_publish` | True | If True and job has `transfer_target_location`, a transfer job is created for this component after publish. Snapshot: always True. Playblast: always False. File components: from UI/HDA per component. |

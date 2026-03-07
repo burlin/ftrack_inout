@@ -8,9 +8,12 @@ Create a modular, DCC-agnostic publisher that can handle different component typ
 ```
 ftrack_plugins/ftrack_inout/publisher/
 ├── __init__.py                    # Package initialization, dependency setup
-├── core.py                        # Main publisher engine (DCC-agnostic)
-├── component_types.py             # Component type definitions and base classes
-├── rules/                         # Component publishing rules
+├── core/                          # Core publisher (DCC-agnostic)
+│   ├── publisher.py               # PublishJob, ComponentData, Publisher
+│   ├── job_builder.py             # JobBuilder (from_qt_widget, from_houdini_node, from_dict)
+│   ├── transfer_after_publish.py  # create_transfer_job, get_locations_with_accessor, resolve_location_id
+│   └── ...
+├── rules/                         # Component publishing rules (if used)
 │   ├── __init__.py
 │   ├── base_rule.py              # Base rule class
 │   ├── snapshot_rule.py          # Snapshot component rules
@@ -72,7 +75,7 @@ ftrack_plugins/ftrack_inout/publisher/
 - **Note**: Sequences are just a component type in Ftrack, handled the same way
 - **DCC Functions**: 
   - `get_component_count()` - Get number of components from UI
-  - `get_component_data(index)` - Get component name, path, metadata for index
+  - `get_component_data(index)` - Get component name, path, metadata for index (includes `transfer_after_publish{n}`)
   - `validate_file_path(path)` - Check if file/sequence exists
   - `normalize_sequence_path(path)` - Convert sequence to proper format (if needed)
 - **Metadata**:
@@ -81,9 +84,11 @@ ftrack_plugins/ftrack_inout/publisher/
 - **Rules**:
   - Iterate through component count
   - Check `export{n}` toggle for each component
+  - Check `transfer_after_publish{n}` for transfer-after-publish (default True)
   - Validate file/sequence exists (skip if missing and not sequence token)
   - Handle sequence formatting (`.vdb`, `.exr`, etc.) - normalize to Ftrack format
   - Create component with name and metadata
+- **Transfer after publish**: Snapshot always included in transfer when target is set; playblast never; file components per `transfer_after_publish` flag.
 
 ### 4. Custom Component (Extensible)
 - **Purpose**: Allow adding custom component types (e.g., JSON metadata, special elements)
@@ -222,6 +227,10 @@ class Publisher:
             
             # 7. Update node parameters
             self._update_node_parameters(target_node, asset_version, asset, task)
+            
+            # 8. Transfer after publish (optional): if job.transfer_target_location is set,
+            #    create transfer jobs for each created component that has transfer_after_publish=True
+            #    (see core/transfer_after_publish.py: create_transfer_job, resolve_location_id)
             
             return True, "", created_components
             
@@ -528,6 +537,26 @@ class FileComponentRule(ComponentRule):
         return components
 ```
 
+## Transfer after publish
+
+### `publisher/core/transfer_after_publish.py`
+
+- **create_transfer_job(session, component_id, from_location_id, to_location_id, ...)**  
+  Creates one Job and publishes `mroya.transfer.request`; returns job_id or None. Caller decides which components to transfer and from/to locations.
+
+- **get_component_location_id(session, component_id)**  
+  Returns the location_id where the component currently is (first ComponentLocation).
+
+- **resolve_location_id(session, name_or_id)**  
+  Resolves location by name or by id (uuid with or without dashes); returns location id or None.
+
+- **get_locations_with_accessor(session)**  
+  Returns a **list of dicts** describing locations that have an accessor (real storage), for dropdowns. Each dict: `{"id", "name", "label", "location_type"}` (`location_type`: `"s3"` | `"disk"` | `"unknown"`). Sorted by label/name; system locations (ftrack.origin, etc.) excluded. Used by standalone widget, Houdini menu script (`get_transfer_target_location_menu_items`), and can be used by Maya to fill the target-location dropdown.
+
+**PublishJob / ComponentData:**
+- `PublishJob.transfer_target_location` (str | None): target location id or name; if set, step 8 runs.
+- `ComponentData.transfer_after_publish` (bool): whether to create a transfer job for this component when step 8 runs (snapshot: always True; playblast: always False; file components: from UI/HDA).
+
 ## UI Bridge
 
 ### Standalone Qt UI (`publisher/ui/publisher_widget.py`)
@@ -543,7 +572,8 @@ class FileComponentRule(ComponentRule):
   - Asset selection/creation
   - Snapshot toggle
   - Playblast path input
-  - Component tabs (like HDA interface)
+  - Component tabs (like HDA interface), per-component "Transfer after publish" checkbox
+  - **Target location** dropdown (filled via `get_locations_with_accessor(session)`); value = location id or empty for no transfer
   - Metadata key/value pairs
   - Publish button
 
@@ -765,9 +795,14 @@ else:
 5. **Enable/Disable Toggles**:
    - **Snapshot**: `use_snapshot` parameter (global toggle)
    - **Playblast**: `use_playblast` parameter (global toggle)
-   - **File components**: `export{n}` toggles per component (each component can be individually disabled)
+   - **File components**: `export{n}` toggles per component (each component can be individually disabled); `transfer_after_publish{n}` per component (default True) for transfer after publish
    - **Custom components**: Configurable enable parameters per component type
    - **Note**: If a component is disabled, it is skipped during publish (no error)
+
+7. **Transfer after publish**:
+   - **Target location**: One target for the whole publish (`PublishJob.transfer_target_location`); location id or name; UI: dropdown filled from `get_locations_with_accessor(session)`.
+   - **Per component**: `ComponentData.transfer_after_publish`; snapshot always True, playblast always False, file components from UI/HDA.
+   - **Step 8**: After commit, for each created component with `transfer_after_publish=True`, resolve target location and call `create_transfer_job(session, comp_id, from_loc_id, to_loc_id, ...)`.
 
 6. **Error Handling**:
    - **On any error**: Do NOT commit session, return error message

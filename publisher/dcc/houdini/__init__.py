@@ -39,6 +39,36 @@ except ImportError as e:
     _log.warning(f"Core publisher not available: {e}")
 
 
+def get_transfer_target_location_menu_items() -> List[str]:
+    """
+    Return menu items for HDA "Target location" dropdown.
+
+    Houdini Menu Script expects [token1, label1, token2, label2, ...] where token is the
+    stored value (location id) and label is the displayed text.
+
+    Use in publish HDA Menu Script for parameter transfer_target_location:
+        from ftrack_inout.publisher.dcc.houdini import get_transfer_target_location_menu_items
+        return get_transfer_target_location_menu_items()
+    """
+    # token (stored value), label (displayed)
+    result: List[str] = ["", "(no transfer)"]
+    try:
+        from ....common.session_factory import get_shared_session
+        from ...core.transfer_after_publish import get_locations_with_accessor
+        session = get_shared_session()
+        if not session:
+            return result
+        locs = get_locations_with_accessor(session)
+        for loc in locs:
+            loc_id = loc.get("id", "") or ""
+            label = (loc.get("label") or loc.get("name") or "").strip() or loc_id
+            result.append(loc_id)
+            result.append(label)
+    except Exception as e:
+        _log.warning("get_transfer_target_location_menu_items: %s", e)
+    return result
+
+
 class HoudiniParameterInterface:
     """Parameter interface for Houdini HDA nodes.
     
@@ -309,7 +339,8 @@ def build_job_from_hda(node) -> PublishJob:
             file_path=snapshot_path,
             component_type='snapshot',
             export_enabled=True,
-            metadata=snapshot_metadata  # No 'dcc' tag for snapshot, but has ilink
+            metadata=snapshot_metadata,  # No 'dcc' tag for snapshot, but has ilink
+            transfer_after_publish=True,  # Snapshot always included in transfer when transfer is enabled
         ))
     
     # 2. Playblast component
@@ -328,7 +359,8 @@ def build_job_from_hda(node) -> PublishJob:
             file_path=playblast_path,
             component_type='playblast',
             export_enabled=True,
-            metadata={'dcc': 'houdini'}
+            metadata={'dcc': 'houdini'},
+            transfer_after_publish=False,  # Playblast is not transferred after publish
         ))
     
     # 3. File components (always read, use_custom only controls UI visibility)
@@ -355,6 +387,9 @@ def build_job_from_hda(node) -> PublishJob:
             
             export_val = get_parm(f'export{i}')
             export_enabled = (export_val == 1 or export_val is True) if export_val is not None else True
+            
+            transfer_after_val = get_parm(f'transfer_after_publish{i}')
+            transfer_after_publish = (transfer_after_val == 1 or transfer_after_val is True) if transfer_after_val is not None else True
             
             # Skip placeholder paths (e.g., "*.abc", "*.hip") - these are templates, not real files
             if file_path.startswith('*') or not file_path.strip():
@@ -399,6 +434,7 @@ def build_job_from_hda(node) -> PublishJob:
                 metadata=metadata,
                 sequence_pattern=sequence_pattern,
                 frame_range=frame_range,
+                transfer_after_publish=transfer_after_publish,
             ))
     
     # Get scene path
@@ -423,6 +459,21 @@ def build_job_from_hda(node) -> PublishJob:
     if thumbnail_path:
         thumbnail_path = str(thumbnail_path).strip() or None
     
+    # Transfer after publish: target location (menu stores location id or "")
+    transfer_target_location = get_parm('transfer_target_location') or ''
+    if transfer_target_location is not None:
+        transfer_target_location = str(transfer_target_location).strip() or None
+    else:
+        transfer_target_location = None
+    # Debug: compare with publisher log to find where truncation happens
+    if transfer_target_location:
+        _log.info(
+            "[build_job_from_hda] transfer_target_location read from parm: len=%d repr=%s",
+            len(transfer_target_location),
+            repr(transfer_target_location),
+        )
+        print(f"[build_job_from_hda] transfer_target_location from parm: len={len(transfer_target_location)} repr={repr(transfer_target_location)}")
+
     # Build job
     job = PublishJob(
         task_id=task_id,
@@ -434,6 +485,7 @@ def build_job_from_hda(node) -> PublishJob:
         thumbnail_path=thumbnail_path,
         source_dcc='houdini',
         source_scene=source_scene,
+        transfer_target_location=transfer_target_location,
     )
     
     _log.info(

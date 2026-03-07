@@ -41,7 +41,10 @@ class ComponentData:
     # Sequence-specific
     sequence_pattern: Optional[str] = None
     frame_range: Optional[Tuple[int, int]] = None
-    
+
+    # Transfer after publish (default on)
+    transfer_after_publish: bool = True
+
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization/logging."""
         return {
@@ -52,8 +55,9 @@ class ComponentData:
             'metadata': self.metadata,
             'sequence_pattern': self.sequence_pattern,
             'frame_range': self.frame_range,
+            'transfer_after_publish': self.transfer_after_publish,
         }
-    
+
     @classmethod
     def from_dict(cls, data: dict) -> 'ComponentData':
         """Create from dictionary."""
@@ -65,6 +69,7 @@ class ComponentData:
             metadata=data.get('metadata', {}),
             sequence_pattern=data.get('sequence_pattern'),
             frame_range=data.get('frame_range'),
+            transfer_after_publish=data.get('transfer_after_publish', True),
         )
 
 
@@ -100,7 +105,10 @@ class PublishJob:
     source_dcc: str = "unknown"
     source_scene: Optional[str] = None
     created_at: datetime = field(default_factory=datetime.now)
-    
+
+    # Transfer after publish: target location name or id (empty = no transfer)
+    transfer_target_location: Optional[str] = None
+
     # Validation state
     _is_valid: bool = field(default=False, repr=False)
     _validation_errors: List[str] = field(default_factory=list, repr=False)
@@ -172,6 +180,7 @@ class PublishJob:
             'source_dcc': self.source_dcc,
             'source_scene': self.source_scene,
             'created_at': self.created_at.isoformat(),
+            'transfer_target_location': self.transfer_target_location,
         }
     
     def to_json(self, indent: int = 2) -> str:
@@ -201,6 +210,7 @@ class PublishJob:
             source_dcc=data.get('source_dcc', 'unknown'),
             source_scene=data.get('source_scene'),
             created_at=created_at,
+            transfer_target_location=data.get('transfer_target_location'),
         )
 
 
@@ -329,6 +339,8 @@ class Publisher:
         print(f"  Scene:        {job.source_scene or '(not saved)'}")
         print(f"  Comment:      {job.comment or '(no comment)'}")
         print(f"  Thumbnail:    {job.thumbnail_path or '(none)'}")
+        transfer_target = getattr(job, 'transfer_target_location', None) or None
+        print(f"  Transfer to:  {transfer_target or '(no transfer)'}")
         print(f"  Created at:   {job.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
         
         # Components
@@ -340,10 +352,12 @@ class Publisher:
         
         for i, comp in enumerate(job.components, 1):
             status = "✓ ENABLED" if comp.export_enabled else "✗ DISABLED"
+            transfer_after = getattr(comp, 'transfer_after_publish', True)
             print(f"\n  [{i}] {comp.name}")
             print(f"      Status:   {status}")
             print(f"      Type:     {comp.component_type}")
             print(f"      Path:     {comp.file_path or '(will be generated)'}")
+            print(f"      Transfer after publish: {'yes' if transfer_after else 'no'}")
             if comp.sequence_pattern:
                 print(f"      Pattern:  {comp.sequence_pattern}")
             if comp.frame_range:
@@ -375,6 +389,15 @@ class Publisher:
             actions.append(f"4. Set version thumbnail from: {job.thumbnail_path}")
         actions.append(f"5. Update asset metadata index")
         actions.append(f"6. Commit session")
+        if transfer_target:
+            transfer_components = [c.name for c in enabled if getattr(c, 'transfer_after_publish', True)]
+            if transfer_components:
+                tid = transfer_target if len(transfer_target) <= 40 else transfer_target[:37] + "..."
+                actions.append(f"7. Create transfer job(s) for: {', '.join(transfer_components)} → {tid}")
+            else:
+                actions.append(f"7. (No components with transfer after publish)")
+        else:
+            actions.append(f"7. (No transfer target set)")
         
         for action in actions:
             print(f"  {action}")
@@ -507,8 +530,9 @@ class Publisher:
             created_components = []
             component_ids = []
             component_paths = {}
-            
-            for comp in job.enabled_components:
+            enabled_indices_for_created = []  # index in job.enabled_components for each created
+
+            for enabled_idx, comp in enumerate(job.enabled_components):
                 _log.info(f"[Publisher] Processing component: {comp.name} ({comp.component_type})")
                 
                 try:
@@ -563,7 +587,8 @@ class Publisher:
                         created_components.append(comp_entity)
                         component_ids.append(comp_entity['id'])
                         component_paths[comp_entity['id']] = file_path
-                        
+                        enabled_indices_for_created.append(enabled_idx)
+
                         _log.info(f"[Publisher] Component created: {comp_entity['id']}")
                 
                 except Exception as comp_error:
@@ -653,6 +678,56 @@ class Publisher:
                         _log.info(f"[Publisher] Timelog created: {timelog_id} ({per_task_secs:.0f}s)")
                 except Exception as tl_err:
                     _log.warning(f"[Publisher] Auto-timelog failed (non-critical): {tl_err}")
+
+            # ---------------------------------------------------------------
+            # 8. Transfer after publish (optional, per-component)
+            # ---------------------------------------------------------------
+            transfer_target = getattr(job, 'transfer_target_location', None) or None
+            if transfer_target:
+                _log.info(
+                    "[Publisher] transfer_target_location in job: len=%d repr=%s",
+                    len(transfer_target),
+                    repr(transfer_target),
+                )
+                print(f"[Publisher] transfer_target_location in job: len={len(transfer_target)} repr={repr(transfer_target)}")
+            if transfer_target and component_ids:
+                try:
+                    from .transfer_after_publish import (
+                        create_transfer_job,
+                        get_component_location_id,
+                        resolve_location_id,
+                    )
+                    to_location_id = resolve_location_id(session, transfer_target)
+                    if not to_location_id:
+                        _log.warning(
+                            "[Publisher] Transfer target location not found: %s",
+                            transfer_target,
+                        )
+                    else:
+                        enabled = job.enabled_components
+                        created = 0
+                        for i, comp_id in enumerate(component_ids):
+                            enab_idx = enabled_indices_for_created[i] if i < len(enabled_indices_for_created) else i
+                            if enab_idx >= len(enabled) or not getattr(enabled[enab_idx], 'transfer_after_publish', True):
+                                continue
+                            from_loc_id = get_component_location_id(session, comp_id)
+                            if not from_loc_id:
+                                continue
+                            comp_label = created_components[i].get("name", "") if i < len(created_components) else ""
+                            jid = create_transfer_job(
+                                session,
+                                comp_id,
+                                from_loc_id,
+                                to_location_id,
+                                component_label=comp_label,
+                                to_location_name=transfer_target,
+                            )
+                            if jid:
+                                created += 1
+                        if created:
+                            _log.info("[Publisher] Created %d transfer job(s) to %s", created, transfer_target[:32])
+                except Exception as te:
+                    _log.warning("[Publisher] Transfer-after-publish failed (non-fatal): %s", te)
 
             return PublishResult(
                 success=True,
