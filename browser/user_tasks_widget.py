@@ -153,6 +153,7 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
 
         # Left pane: stacked task views (Tree / Board) + task action buttons.
         left_widget = QtWidgets.QWidget(splitter)
+        self._left_pane_widget = left_widget
         left_layout = QtWidgets.QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(4)
@@ -320,7 +321,7 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 3)
         splitter.setStretchFactor(2, 2)
-        left_widget.setMinimumWidth(220)
+        left_widget.setMinimumWidth(max(220, int(220 * self._content_scale_factor())))
 
         # ---------------- Board page (tasks grouped by status) ----------------
         # Board view lives in the same left pane as the tree, using the stacked widget.
@@ -354,8 +355,10 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         if splitter is not None and splitter.count() >= 3:
             total = splitter.width()
             if total > 100:
-                # Left ~28%, middle ~44%, right ~28% so content areas fill the frame.
-                left = max(220, min(320, total // 4))
+                scale = self._content_scale_factor()
+                min_left = max(220, int(220 * scale))
+                max_left = max(320, int(320 * scale))
+                left = max(min_left, min(max_left, total // 4))
                 rest = total - left
                 mid = rest * 3 // 5
                 right = rest - mid
@@ -644,6 +647,8 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
 
         groups = self._build_status_groups()
         if not groups:
+            self._apply_left_pane_sizing_for_view_mode(is_board=True)
+            self._update_splitter_for_board()
             return
 
         # Optional status filter for Board view (e.g. only "In progress").
@@ -691,7 +696,9 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
             self.board_layout.addWidget(column_widget)
             self._board_lists[status] = list_widget
 
-        self.board_layout.addStretch(1)
+        # No stretch: board frame fits content width instead of filling the pane.
+        self._apply_left_pane_sizing_for_view_mode(is_board=True)
+        self._update_splitter_for_board()
 
     # ------------------------------------------------------------------ Slots / helpers
 
@@ -705,6 +712,59 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
                 pass
         self._load_tasks_for_current_project()
 
+    def _content_scale_factor(self) -> float:
+        """Scale factor for layout sizes (Windows DPI scaling 125%, 150%, 175%, etc.)."""
+        try:
+            # devicePixelRatioF() reflects OS scale (e.g. 1.75 for 175%).
+            scale = float(self.devicePixelRatioF())  # type: ignore[attr-defined]
+            # Ensure at least 1.25 so long names fit even if DPI is not reported.
+            return max(1.25, scale)
+        except Exception:
+            return 1.25
+
+    def _apply_left_pane_sizing_for_view_mode(self, is_board: bool) -> None:
+        """Board mode: left pane fits content (fixed-width columns). Tree mode: left pane stretches."""
+        left = getattr(self, "_left_pane_widget", None)
+        if left is None:
+            return
+        expanding = QtWidgets.QSizePolicy.Expanding  # type: ignore[attr-defined]
+        preferred = QtWidgets.QSizePolicy.Preferred  # type: ignore[attr-defined]
+        if is_board:
+            # Fit to board content; use generous width so long names fit (e.g. at 175% DPI).
+            scale = self._content_scale_factor()
+            num_cols = len(getattr(self, "_board_lists", {}))
+            if num_cols == 0:
+                num_cols = 1
+            # Base 300px per column so "project.shots.taskname" fits; scale for DPI.
+            board_col_width = int(300 * scale)
+            board_col_spacing = int(12 * scale)
+            board_extra = int(90 * scale)  # scrollbar, margins, list padding
+            content_width = num_cols * board_col_width + (num_cols - 1) * board_col_spacing + board_extra
+            left.setMinimumWidth(content_width)
+            left.setMaximumWidth(content_width)
+            left.setSizePolicy(preferred, left.sizePolicy().verticalPolicy())
+            return content_width
+        else:
+            left.setMinimumWidth(max(220, int(220 * self._content_scale_factor())))
+            left.setMaximumWidth(16777215)  # QWIDGETSIZE_MAX
+            left.setSizePolicy(expanding, left.sizePolicy().verticalPolicy())
+            return None
+
+    def _update_splitter_for_board(self) -> None:
+        """Apply splitter sizes so the left pane gets its board content width (fix on Tree -> Board switch)."""
+        left = getattr(self, "_left_pane_widget", None)
+        splitter = getattr(self, "_main_splitter", None)
+        if left is None or splitter is None or splitter.count() < 3:
+            return
+        content_width = left.maximumWidth()
+        total = splitter.width()
+        if total < content_width + 100:
+            return
+        rest = total - content_width
+        mid = rest * 3 // 5
+        right = rest - mid
+        splitter.setSizes([content_width, mid, right])
+
     def _on_view_mode_changed(self, index: int) -> None:
         """Handle switching between Tree and Board views (dropdown)."""
         if not hasattr(self, "task_view_stack"):
@@ -714,6 +774,7 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         target_index = 1 if use_board else 0
         if 0 <= target_index < self.task_view_stack.count():
             self.task_view_stack.setCurrentIndex(target_index)
+        self._apply_left_pane_sizing_for_view_mode(use_board)
         # Re-populate current view using already loaded tasks
         if use_board:
             self._populate_board()
