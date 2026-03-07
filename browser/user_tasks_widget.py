@@ -146,8 +146,10 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
 
         # Main splitter: left = tasks (Tree / Board) + actions,
         # middle = files/snapshots, right = linked components.
-        splitter = QtWidgets.QSplitter(self)
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self)  # type: ignore[attr-defined]
         layout.addWidget(splitter, 1)
+        self._main_splitter = splitter
+        self._splitter_initial_sizes_set = False
 
         # Left pane: stacked task views (Tree / Board) + task action buttons.
         left_widget = QtWidgets.QWidget(splitter)
@@ -177,6 +179,7 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         self.task_tree.setRootIsDecorated(True)
         self.task_tree.setAlternatingRowColors(True)
         self.task_tree.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.task_tree.itemDoubleClicked.connect(self._on_task_tree_item_double_clicked)
         tree_view_layout.addWidget(self.task_tree, 1)
 
         self.task_view_stack.addWidget(tree_view_page)
@@ -304,9 +307,20 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         right_layout.addLayout(linked_btn_bar)
 
         splitter.addWidget(right_widget)
+
+        # So that all panes scale with the window and fill the frame (no empty stretch on the right).
+        expanding = QtWidgets.QSizePolicy.Expanding  # type: ignore[attr-defined]
+        preferred = QtWidgets.QSizePolicy.Preferred  # type: ignore[attr-defined]
+        for w in (left_widget, middle_widget, right_widget):
+            w.setSizePolicy(expanding, preferred)
+        for tree in (self.task_tree, self.files_tree, self.snapshots_tree, self.linked_tree):
+            tree.setSizePolicy(expanding, expanding)
+
+        # Stretch: left gets a solid share so it scales; middle and right fill the rest.
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 3)
         splitter.setStretchFactor(2, 2)
+        left_widget.setMinimumWidth(220)
 
         # ---------------- Board page (tasks grouped by status) ----------------
         # Board view lives in the same left pane as the tree, using the stacked widget.
@@ -330,6 +344,23 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
 
         # Connect selection from tree view
         self.task_tree.itemSelectionChanged.connect(self._on_task_selection_changed)
+
+    def showEvent(self, event: Any) -> None:  # type: ignore[override]
+        """Set initial splitter sizes once so left pane and detail panes get a sensible share."""
+        super().showEvent(event)
+        if getattr(self, "_splitter_initial_sizes_set", True):
+            return
+        splitter = getattr(self, "_main_splitter", None)
+        if splitter is not None and splitter.count() >= 3:
+            total = splitter.width()
+            if total > 100:
+                # Left ~28%, middle ~44%, right ~28% so content areas fill the frame.
+                left = max(220, min(320, total // 4))
+                rest = total - left
+                mid = rest * 3 // 5
+                right = rest - mid
+                splitter.setSizes([left, mid, right])
+                self._splitter_initial_sizes_set = True
 
     def _build_board_page(self) -> None:
         """Create Board view page (tasks grouped by status) inside task view stack."""
@@ -707,6 +738,36 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
             finally:
                 self.view_mode_combo.blockSignals(False)
             self._populate_tree()
+
+    def _on_task_tree_item_double_clicked(
+        self, item: QtWidgets.QTreeWidgetItem, column: int  # type: ignore[name-defined]
+    ) -> None:
+        """On double-click on a task in Tree: set board filter to task status, switch to Board, focus task.
+
+        Allows switching from a task in review (or other state) to other tasks by
+        focusing the board column for the double-clicked task's status.
+        """
+        data = item.data(0, QtCore.Qt.UserRole) if item else None  # type: ignore[attr-defined]
+        if not isinstance(data, dict) or not data.get("id"):
+            return
+
+        task_id = str(data["id"])
+        status_name = (data.get("status_name") or "No Status").strip() or "No Status"
+        norm_status = status_name.lower()
+
+        self._board_filter_statuses = {norm_status}
+        try:
+            self.view_mode_combo.blockSignals(True)
+            if self.view_mode_combo.count() > 1:
+                self.view_mode_combo.setCurrentIndex(1)
+            if hasattr(self, "task_view_stack") and self.task_view_stack.count() > 1:
+                self.task_view_stack.setCurrentIndex(1)
+        finally:
+            self.view_mode_combo.blockSignals(False)
+
+        self._populate_board()
+        self._select_task_in_board_by_id(task_id)
+        self._on_task_selected(data)
 
     def _on_task_selection_changed(self) -> None:
         """Handle selection change in task tree.
