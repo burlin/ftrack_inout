@@ -515,7 +515,7 @@ class Publisher:
                     comp_entity = None
                     
                     if comp.component_type == 'playblast':
-                        # Playblast uses encode_media
+                        # Playblast: encode for ftrack web review AND store as a file component
                         if comp.file_path:
                             file_path = os.path.normpath(comp.file_path)
                             _log.info(f"[Publisher] Encoding media: {file_path}")
@@ -524,7 +524,20 @@ class Publisher:
                                 session.commit()
                             except Exception as ce:
                                 _log.warning(f"[Publisher] Commit after encode_media: {ce}")
-                            continue
+
+                            # Also store playblast as a regular file component in the location
+                            _log.info(f"[Publisher] Storing playblast as file component: {file_path}")
+                            metadata = dict(comp.metadata) if comp.metadata else {}
+                            comp_entity = asset_version.create_component(
+                                file_path,
+                                data={'name': comp.name, 'metadata': metadata},
+                                location='auto',
+                            )
+                            created_components.append(comp_entity)
+                            component_ids.append(comp_entity['id'])
+                            component_paths[comp_entity['id']] = file_path
+                            _log.info(f"[Publisher] Playblast component created: {comp_entity['id']}")
+                        continue
                     
                     else:
                         # Regular component (snapshot, file, sequence)
