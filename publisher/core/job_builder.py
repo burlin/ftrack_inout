@@ -45,7 +45,8 @@ class JobBuilder:
                 file_path=None,  # Will be created during real publish
                 component_type='snapshot',
                 export_enabled=True,
-                metadata={}  # No 'dcc' tag for snapshot
+                metadata={},  # No 'dcc' tag for snapshot
+                transfer_after_publish=True,  # Snapshot always included in transfer when transfer is enabled
             ))
         
         # 2. Playblast component
@@ -58,7 +59,8 @@ class JobBuilder:
                 file_path=playblast_path,
                 component_type='playblast',
                 export_enabled=True,
-                metadata={'dcc': source_dcc}
+                metadata={'dcc': source_dcc},
+                transfer_after_publish=False,  # Playblast is not transferred after publish
             ))
         
         # 3. File components from tabs
@@ -78,7 +80,9 @@ class JobBuilder:
                     file_path = comp_data.get(f'file_path{idx}', '')
                     export_val = comp_data.get(f'export{idx}', 1)
                     export_enabled = (export_val == 1 or export_val == True)
-                    
+                    transfer_after = comp_data.get(f'transfer_after_publish{idx}', 1)
+                    transfer_after_publish = (transfer_after == 1 or transfer_after is True)
+
                     # Collect metadata from component
                     metadata = {'dcc': source_dcc}
                     meta_count = comp_data.get(f'meta_count{idx}', 0)
@@ -108,13 +112,16 @@ class JobBuilder:
                         export_enabled=export_enabled,
                         metadata=metadata,
                         sequence_pattern=sequence_pattern,
+                        transfer_after_publish=transfer_after_publish,
                     ))
-        
+
         # Build PublishJob
         thumbnail_path = widget.get_parameter('thumbnail_path') or None
         if thumbnail_path:
             thumbnail_path = str(thumbnail_path).strip() or None
-        
+
+        transfer_target_location = (widget.get_parameter('transfer_target_location') or '').strip() or None
+
         job = PublishJob(
             task_id=widget.get_parameter('p_task_id') or '',
             asset_id=widget.get_parameter('p_asset_id') or None,
@@ -125,6 +132,7 @@ class JobBuilder:
             thumbnail_path=thumbnail_path,
             source_dcc=source_dcc,
             source_scene=None,  # TODO: get from widget if available
+            transfer_target_location=transfer_target_location,
         )
         
         _log.info(

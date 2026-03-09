@@ -24,6 +24,10 @@ from .job_builder import (
     JobBuilder,
 )
 
+from .transfer_after_publish import (
+    get_locations_with_accessor,
+)
+
 __all__ = [
     # Selector functions
     'check_task_id',
@@ -37,4 +41,5 @@ __all__ = [
     'PublishResult',
     'Publisher',
     'JobBuilder',
+    'get_locations_with_accessor',
 ]

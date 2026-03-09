@@ -126,7 +126,13 @@ class ComponentTabWidget(QtWidgets.QWidget):
         self.export_checkbox = QtWidgets.QCheckBox("export")
         self.export_checkbox.setChecked(True)
         layout.addWidget(self.export_checkbox)
-        
+
+        # Transfer after publish (default on)
+        self.transfer_after_publish_checkbox = QtWidgets.QCheckBox("Transfer after publish")
+        self.transfer_after_publish_checkbox.setToolTip("Create a transfer job to target location after this component is published.")
+        self.transfer_after_publish_checkbox.setChecked(True)
+        layout.addWidget(self.transfer_after_publish_checkbox)
+
         # Component name
         name_layout = QtWidgets.QHBoxLayout()
         name_layout.addWidget(QtWidgets.QLabel("comp_name:"))
@@ -477,6 +483,7 @@ class ComponentTabWidget(QtWidgets.QWidget):
         
         data = {
             f'export{idx}': 1 if self.export_checkbox.isChecked() else 0,
+            f'transfer_after_publish{idx}': 1 if self.transfer_after_publish_checkbox.isChecked() else 0,
             f'comp_name{idx}': self.comp_name_edit.text(),
             f'file_path{idx}': self.file_path_edit.text(),
             f'meta_count{idx}': self.meta_count_spin.value(),
@@ -497,7 +504,12 @@ class ComponentTabWidget(QtWidgets.QWidget):
         # Export
         export_val = data.get(f'export{idx}', 1)
         self.export_checkbox.setChecked(export_val == 1)
-        
+
+        # Transfer after publish
+        transfer_val = data.get(f'transfer_after_publish{idx}', 1)
+        if getattr(self, 'transfer_after_publish_checkbox', None) is not None:
+            self.transfer_after_publish_checkbox.setChecked(transfer_val == 1)
+
         # Name and path
         self.comp_name_edit.setText(data.get(f'comp_name{idx}', ''))
         self.file_path_edit.setText(data.get(f'file_path{idx}', ''))
@@ -586,15 +598,53 @@ class PublisherWidget(QtWidgets.QWidget):
         # Comment Section
         self._create_comment_section(scroll_layout)
         
+        # Transfer after publish: target location dropdown (optional)
+        transfer_group = QtWidgets.QGroupBox("After publish")
+        transfer_layout = QtWidgets.QVBoxLayout(transfer_group)
+        target_row = QtWidgets.QHBoxLayout()
+        target_row.addWidget(QtWidgets.QLabel("Target location:"))
+        self.transfer_target_location_combo = QtWidgets.QComboBox()
+        self.transfer_target_location_combo.setToolTip(
+            "After publish, create transfer jobs to this location for components that have 'Transfer after publish' checked. "
+            "Requires mroya_transfer_manager in ftrack Connect."
+        )
+        target_row.addWidget(self.transfer_target_location_combo)
+        transfer_layout.addLayout(target_row)
+        scroll_layout.addWidget(transfer_group)
+        self._populate_transfer_target_locations()
+
         scroll.setWidget(scroll_widget)
         main_layout.addWidget(scroll)
-        
+
         # Render/Publish button
         self.publish_btn = QtWidgets.QPushButton("Render")
         self.publish_btn.setMinimumHeight(40)
         self.publish_btn.clicked.connect(self._on_publish_clicked)
         main_layout.addWidget(self.publish_btn)
-    
+
+    def _populate_transfer_target_locations(self):
+        """Fill Target location combo from session; default to first S3."""
+        combo = getattr(self, "transfer_target_location_combo", None)
+        if not combo:
+            return
+        combo.clear()
+        combo.addItem("(no transfer)", "")
+        if not self._session:
+            return
+        try:
+            from ftrack_inout.publisher.core.transfer_after_publish import get_locations_with_accessor
+            locations = get_locations_with_accessor(self._session)
+            first_s3_index = None
+            for loc in locations:
+                label = loc.get("label") or loc.get("name") or loc.get("id", "")
+                combo.addItem(label, loc.get("id", ""))
+                if first_s3_index is None and loc.get("location_type") == "s3":
+                    first_s3_index = combo.count() - 1
+            if first_s3_index is not None:
+                combo.setCurrentIndex(first_s3_index)
+        except Exception as e:
+            _log.debug("_populate_transfer_target_locations: %s", e)
+
     def _create_task_section(self, parent_layout):
         """Create Task Definition section."""
         group = QtWidgets.QGroupBox("Task Definition")
@@ -1379,6 +1429,7 @@ class PublisherWidget(QtWidgets.QWidget):
             'thumbnail_path': self.thumbnail_edit.text().strip() if hasattr(self, 'thumbnail_edit') else '',
             'components': self.components_spin.value(),
             'comment': self.comment_edit.toPlainText() if hasattr(self, 'comment_edit') else '',
+            'transfer_target_location': (self.transfer_target_location_combo.currentData() or "") if getattr(self, "transfer_target_location_combo", None) else "",
         }
         
         # Component parameters

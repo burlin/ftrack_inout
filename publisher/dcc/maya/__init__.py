@@ -572,7 +572,8 @@ def build_job_from_maya_node(node_name: str) -> 'PublishJob':
             file_path=snapshot_path,
             component_type='snapshot',
             export_enabled=True,
-            metadata=snapshot_metadata
+            metadata=snapshot_metadata,
+            transfer_after_publish=True,  # Snapshot always included in transfer when transfer is enabled
         ))
     
     # 2. Playblast component
@@ -585,7 +586,8 @@ def build_job_from_maya_node(node_name: str) -> 'PublishJob':
                 file_path=playblast_path,
                 component_type='playblast',
                 export_enabled=True,
-                metadata={'dcc': 'maya'}
+                metadata={'dcc': 'maya'},
+                transfer_after_publish=False,  # Playblast is not transferred after publish
             ))
     
     # 3. File components
