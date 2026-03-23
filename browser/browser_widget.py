@@ -158,13 +158,22 @@ if PYSIDE6_AVAILABLE:
     class FtrackTaskBrowser(QtWidgets.QWidget):
         """Complete Ftrack Task Browser with exact UI from reference"""
 
-        def __init__(self, parent=None, on_import_to_unreal=None, on_create_handle=None, dcc=None):
+        def __init__(
+            self,
+            parent=None,
+            on_import_to_unreal=None,
+            on_create_handle=None,
+            dcc=None,
+            connect_session=None,
+        ):
             super().__init__(parent)
             self._on_import_to_unreal = on_import_to_unreal  # optional callback(paths, content_subpath) -> imported count
             self._on_create_handle = on_create_handle  # optional callback(component_id, content_subpath, asset_version_id) -> asset path or None
+            # ftrack_api.Session from ftrack Connect (for event_hub when publishing track updates).
+            self._connect_session = connect_session
 
             # Remember DCC context for component filtering and other behavior tweaks.
-            # Default to "houdini" as this browser is primarily used there.
+            # Default to "houdini" as this browser is primarily used here.
             self._dcc = (str(dcc) if dcc is not None else "houdini").strip().lower() or "houdini"
 
             # Per-user settings (used for UI-level overrides, e.g. component filters)
@@ -215,6 +224,156 @@ if PYSIDE6_AVAILABLE:
             self.asset_version_tree.itemSelectionChanged.connect(self.on_asset_version_selection_changed)
             self.asset_version_tree.itemExpanded.connect(self.on_asset_item_expanded)
             self.component_list.itemSelectionChanged.connect(self.on_component_list_selection_changed)
+
+            if self._dcc == "connect":
+                self._track_highlight_timer = QtCore.QTimer(self)
+                self._track_highlight_timer.setInterval(4000)
+                self._track_highlight_timer.timeout.connect(self._refresh_asset_track_highlights)
+                self._track_highlight_timer.start()
+            else:
+                self._track_highlight_timer = None
+
+        def _scenario_scheduler_plugin_root(self):
+            """Sibling folder mroya_asset_scenario_scheduler under ftrack_plugins."""
+            return os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "..", "mroya_asset_scenario_scheduler")
+            )
+
+        def _scenario_track_modules(self):
+            """Lazy import of track storage + scenario catalog (no hard dep if missing)."""
+            try:
+                root = self._scenario_scheduler_plugin_root()
+                if not os.path.isdir(root):
+                    return None
+                if root not in sys.path:
+                    sys.path.insert(0, root)
+                from asset_track_storage import (  # type: ignore
+                    add_asset_track_record,
+                    get_tracked_asset_id_set,
+                )
+                from scenario_catalog import KNOWN_SCENARIOS  # type: ignore
+
+                return add_asset_track_record, get_tracked_asset_id_set, KNOWN_SCENARIOS
+            except Exception as exc:
+                logger.debug("Scenario track modules unavailable: %s", exc)
+                return None
+
+        def _refresh_asset_track_highlights(self):
+            """Green row tint for assets listed in local scheduler asset_tracks (Connect only)."""
+            if self._dcc != "connect":
+                return
+            mod = self._scenario_track_modules()
+            if not mod:
+                return
+            _, get_tracked_asset_id_set, _ = mod
+            try:
+                tracked = get_tracked_asset_id_set()
+            except Exception:
+                return
+            highlight = QtGui.QBrush(QtGui.QColor("#d8f5dc"))
+            clear = QtGui.QBrush()
+            cols = self.asset_version_tree.columnCount()
+            for i in range(self.asset_version_tree.topLevelItemCount()):
+                item = self.asset_version_tree.topLevelItem(i)
+                if item.data(0, ASSET_VERSION_ITEM_TYPE_ROLE) != "Asset":
+                    continue
+                aid = item.data(0, ASSET_VERSION_ITEM_ID_ROLE)
+                use_highlight = bool(aid and str(aid) in tracked)
+                for col in range(cols):
+                    item.setBackground(col, highlight if use_highlight else clear)
+
+        def _publish_asset_track_notify(self):
+            """Tell scenario scheduler to reload JSON (same Connect process)."""
+            sess = getattr(self, "_connect_session", None) or getattr(
+                self.api, "session", None
+            )
+            if not sess or not getattr(sess, "event_hub", None):
+                return
+            try:
+                sess.event_hub.connect()
+            except Exception:
+                pass
+            try:
+                import socket
+
+                evt = ftrack_api.event.base.Event(
+                    topic="mroya.scenario.asset.track",
+                    data={"action": "reload"},
+                    source={
+                        "hostname": socket.gethostname().lower(),
+                        "user": {"username": getattr(sess, "api_user", "") or ""},
+                    },
+                )
+                sess.event_hub.publish(evt, on_error="ignore")
+            except Exception as exc:
+                logger.warning("Failed to publish asset track notify: %s", exc)
+
+        def _on_track_asset_clicked(self):
+            """Connect: register selected Asset for scenario scheduler + local highlight."""
+            item = self.asset_version_tree.currentItem()
+            if (
+                not item
+                or item.data(0, ASSET_VERSION_ITEM_TYPE_ROLE) != "Asset"
+            ):
+                self.update_status("Track: select an Asset row in Asset Versions.")
+                return
+            asset_id = item.data(0, ASSET_VERSION_ITEM_ID_ROLE)
+            if not asset_id:
+                return
+            mod = self._scenario_track_modules()
+            if not mod:
+                self.update_status(
+                    "Track: mroya_asset_scenario_scheduler not found next to ftrack_inout."
+                )
+                return
+            add_rec, _, known = mod
+            dlg = QtWidgets.QDialog(self)
+            dlg.setWindowTitle("Track asset for scenarios")
+            dlg_layout = QtWidgets.QVBoxLayout(dlg)
+            dlg_layout.addWidget(
+                QtWidgets.QLabel(
+                    "Choose scenario to run when use_this_list is updated for this asset."
+                )
+            )
+            dlg_layout.addWidget(QtWidgets.QLabel(f"Asset ID: {asset_id}"))
+            combo = QtWidgets.QComboBox()
+            for entry in known:
+                name = str(entry.get("name") or "")
+                if not name:
+                    continue
+                combo.addItem(name, name)
+                idx = combo.count() - 1
+                combo.setItemData(
+                    idx,
+                    str(entry.get("description") or ""),
+                    QtCore.Qt.ItemDataRole.ToolTipRole,
+                )
+            if combo.count() == 0:
+                self.update_status("Track: no scenarios defined in scenario_catalog.")
+                return
+            dlg_layout.addWidget(combo)
+            buttons = QtWidgets.QHBoxLayout()
+            ok_btn = QtWidgets.QPushButton("OK")
+            cancel_btn = QtWidgets.QPushButton("Cancel")
+            buttons.addWidget(ok_btn)
+            buttons.addWidget(cancel_btn)
+            dlg_layout.addLayout(buttons)
+            ok_btn.clicked.connect(dlg.accept)
+            cancel_btn.clicked.connect(dlg.reject)
+            if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+                return
+            scenario = combo.currentData()
+            if not scenario:
+                scenario = combo.currentText()
+            try:
+                add_rec(str(asset_id), str(scenario))
+            except Exception as exc:
+                self.update_status(f"Track failed: {exc}")
+                logger.error("Track add failed: %s", exc, exc_info=True)
+                return
+            self._publish_asset_track_notify()
+            self._refresh_asset_track_highlights()
+            self.update_status(f"Tracking asset with scenario '{scenario}' (local host).")
 
         def _load_locations(self):
             """Load ftrack locations and populate combo boxes."""
@@ -457,6 +616,18 @@ if PYSIDE6_AVAILABLE:
             self.to_location_combo.currentIndexChanged.connect(self._update_button_states) # Update button on change
             to_location_layout.addWidget(self.to_location_combo)
             location_layout.addLayout(to_location_layout)
+
+            if self._dcc == "connect":
+                self.track_scenario_btn = QtWidgets.QPushButton("Track")
+                self.track_scenario_btn.setToolTip(
+                    "Register selected Asset for local scenario runs (see Scenario Scheduler tab). "
+                    "If any asset is tracked, only tracked assets trigger scenarios on use_this updates."
+                )
+                self.track_scenario_btn.clicked.connect(self._on_track_asset_clicked)
+                self.track_scenario_btn.setEnabled(False)
+                location_layout.addWidget(self.track_scenario_btn)
+            else:
+                self.track_scenario_btn = None
 
             self.transfer_btn = QtWidgets.QPushButton("Start Transfer")
             self.transfer_btn.clicked.connect(self.on_start_transfer_clicked)
@@ -920,6 +1091,14 @@ if PYSIDE6_AVAILABLE:
                     self.transfer_btn.setToolTip("Select a component or asset version to transfer")
                 elif not locations_are_different:
                     self.transfer_btn.setToolTip("Select different source and target locations")
+
+            if getattr(self, "track_scenario_btn", None) is not None:
+                track_ok = False
+                if current_asset_item:
+                    atype = current_asset_item.data(0, ASSET_VERSION_ITEM_TYPE_ROLE)
+                    if atype == "Asset":
+                        track_ok = True
+                self.track_scenario_btn.setEnabled(track_ok)
             
         def on_item_expanded(self, item):
             """Handle tree item expansion with lazy loading"""
@@ -1206,6 +1385,7 @@ if PYSIDE6_AVAILABLE:
                             placeholder.setData(0, ASSET_VERSION_ITEM_TYPE_ROLE, 'Placeholder')
                             asset_item.addChild(placeholder)
                         self.update_status(f"Showing {len(assets)} assets for task.")
+                        self._refresh_asset_track_highlights()
                     
                     self.current_loaded_entity_id = f"task_{entity_id}" 
 
@@ -1405,6 +1585,7 @@ if PYSIDE6_AVAILABLE:
                 
                 self.current_loaded_entity_id = entity_id
                 self.update_status(f"Assets loaded for entity ID: {entity_id} (versions loaded on demand)")
+                self._refresh_asset_track_highlights()
 
             except Exception as e:
                 logger.error(f"Failed to load assets: {str(e)}")
@@ -2964,6 +3145,7 @@ if PYSIDE6_AVAILABLE:
                         placeholder_item = QtWidgets.QTreeWidgetItem(["Click to load versions..."])
                         placeholder_item.setData(0, ASSET_VERSION_ITEM_TYPE_ROLE, 'Placeholder')
                         asset_item.addChild(placeholder_item)
+                    self._refresh_asset_track_highlights()
                 
                 # Use a unique context ID for tasks to avoid conflicts with parent selection
                 self.current_loaded_entity_id = f"task_{entity_id}"

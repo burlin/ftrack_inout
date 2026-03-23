@@ -459,11 +459,14 @@ def build_job_from_hda(node) -> PublishJob:
     if thumbnail_path:
         thumbnail_path = str(thumbnail_path).strip() or None
     
-    # Transfer after publish: target location (menu stores location id or "")
+    # Transfer after publish: target location (menu stores location id or ""). HDA may store menu index (0) instead of token.
     transfer_target_location = get_parm('transfer_target_location') or ''
     if transfer_target_location is not None:
         transfer_target_location = str(transfer_target_location).strip() or None
     else:
+        transfer_target_location = None
+    if transfer_target_location in ('0', 0):
+        _log.info("[build_job_from_hda] transfer_target_location '0' treated as no transfer (parm may store menu index; use String Menu with script returning token, label pairs)")
         transfer_target_location = None
     # Debug: compare with publisher log to find where truncation happens
     if transfer_target_location:

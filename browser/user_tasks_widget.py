@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import time
 from datetime import datetime
@@ -33,6 +34,42 @@ from .simple_api_client import SimpleFtrackApiClient  # type: ignore
 
 
 logger = logging.getLogger(__name__)
+
+# Keys on Asset.metadata that hold structured blobs, not flat component-id pairs.
+_ASSET_METADATA_NON_PAIR_KEYS = frozenset(
+    {
+        "use_this_list",
+        "latest_published_list",
+        "status_note",
+        "ilink",
+    }
+)
+
+# Typical ftrack UUID component id (also used for other entity ids).
+_COMPONENT_ID_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_ftrack_entity_id(value: str) -> bool:
+    """Heuristic: *value* is probably an ftrack id (UUID or long hex token)."""
+    t = value.strip()
+    if len(t) < 8:
+        return False
+    if _COMPONENT_ID_UUID_RE.match(t):
+        return True
+    if len(t) >= 32 and re.fullmatch(r"[0-9a-f]+", t, flags=re.IGNORECASE):
+        return True
+    # Opaque ids without spaces (avoid catching sentences or URLs).
+    if (
+        len(t) >= 20
+        and not any(c in t for c in " \n\r\t")
+        and "://" not in t
+        and "=" not in t
+    ):
+        return True
+    return False
 
 
 class UserTasksDccHandlers(Protocol):
@@ -98,6 +135,16 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
 
         # Lazy initialization of target locations list for linked component transfer.
         self._transfer_locations_initialized: bool = False
+        # Guard recursive use_this_tree itemChanged handling.
+        self._use_this_tree_syncing: bool = False
+        # One-time vertical splitter sizes for the right pane (shot deps vs ilink).
+        self._right_vert_split_sizes_set: bool = False
+        # One-time sizes for shot-linked list vs use_this tree inside the shot-deps stack.
+        self._shot_deps_vert_split_sizes_set: bool = False
+        # After Collect linked: hide shot deps; show only ilink (legacy single frame).
+        self._right_pane_ilink_only: bool = False
+        # Board: ideal width for all status columns; actual splitter uses min(desired, window cap).
+        self._board_desired_left_width: Optional[int] = None
 
         # Optional status filter for Board view (normalized lowercase status names).
         # None means show all statuses; a non-empty set filters to specific ones.
@@ -260,16 +307,92 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
 
         splitter.addWidget(middle_widget)
 
-        # Right pane: linked components (ilink) for selected snapshot
+        # Right pane: shot links + use_this_list (task mode); ilink lives here but stays hidden
+        # until Collect linked (then shot block hides and ilink fills the pane).
         right_widget = QtWidgets.QWidget(splitter)
         right_layout = QtWidgets.QVBoxLayout(right_widget)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(4)
 
-        linked_label = QtWidgets.QLabel("Linked components (ilink):", right_widget)
-        right_layout.addWidget(linked_label, 0)
+        self._right_vert_split = QtWidgets.QSplitter(
+            QtCore.Qt.Vertical, right_widget  # type: ignore[attr-defined]
+        )
 
-        self.linked_tree = QtWidgets.QTreeWidget(right_widget)
+        # Inner vertical split: shot-linked tasks (top) vs asset metadata tree (bottom).
+        self._shot_deps_vert_split = QtWidgets.QSplitter(
+            QtCore.Qt.Vertical, self._right_vert_split  # type: ignore[attr-defined]
+        )
+        self._shot_deps_vert_split.setChildrenCollapsible(False)  # type: ignore[attr-defined]
+        self._shot_deps_vert_split.setHandleWidth(6)
+        self._shot_deps_vert_split.setStretchFactor(0, 1)
+        self._shot_deps_vert_split.setStretchFactor(1, 2)
+
+        shot_top_widget = QtWidgets.QWidget(self._shot_deps_vert_split)
+        shot_top_layout = QtWidgets.QVBoxLayout(shot_top_widget)
+        shot_top_layout.setContentsMargins(0, 0, 0, 0)
+        shot_top_layout.setSpacing(4)
+        shot_top_widget.setMinimumHeight(72)
+
+        shot_links_header = QtWidgets.QLabel(
+            "Shot-linked tasks (web Links: Task incoming/outgoing_links, same parent):",
+            shot_top_widget,
+        )
+        shot_top_layout.addWidget(shot_links_header)
+
+        self.shot_links_list = QtWidgets.QListWidget(shot_top_widget)
+        self.shot_links_list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.shot_links_list.itemSelectionChanged.connect(self._on_shot_link_selection_changed)
+        # Match Board task cards: two-line items, comfortable row height.
+        self.shot_links_list.setSpacing(3)
+        self.shot_links_list.setWordWrap(True)
+        shot_top_layout.addWidget(self.shot_links_list, 1)
+
+        shot_bottom_widget = QtWidgets.QWidget(self._shot_deps_vert_split)
+        shot_bottom_layout = QtWidgets.QVBoxLayout(shot_bottom_widget)
+        shot_bottom_layout.setContentsMargins(0, 0, 0, 0)
+        shot_bottom_layout.setSpacing(4)
+        shot_bottom_widget.setMinimumHeight(96)
+
+        use_this_header = QtWidgets.QLabel(
+            "Components from asset metadata (lists + pairs; select a linked task above):",
+            shot_bottom_widget,
+        )
+        shot_bottom_layout.addWidget(use_this_header)
+
+        self.use_this_tree = QtWidgets.QTreeWidget(shot_bottom_widget)
+        self.use_this_tree.setColumnCount(5)
+        self.use_this_tree.setHeaderLabels(
+            ["Asset / key", "Component id", "Available", "Locations", "Transfer"]
+        )
+        self.use_this_tree.setSortingEnabled(True)
+        self.use_this_tree.setAlternatingRowColors(True)
+        self.use_this_tree.itemChanged.connect(self._on_use_this_tree_item_changed)
+        shot_bottom_layout.addWidget(self.use_this_tree, 1)
+
+        use_this_btn_bar = QtWidgets.QHBoxLayout()
+        use_this_btn_bar.addStretch(1)
+        self.select_all_use_this_btn = QtWidgets.QPushButton(
+            "Select all transferable", shot_bottom_widget
+        )
+        self.select_all_use_this_btn.clicked.connect(self._on_select_all_use_this_clicked)
+        use_this_btn_bar.addWidget(self.select_all_use_this_btn)
+        shot_bottom_layout.addLayout(use_this_btn_bar)
+
+        self._shot_deps_vert_split.addWidget(shot_top_widget)
+        self._shot_deps_vert_split.addWidget(shot_bottom_widget)
+
+        self._shot_deps_widget = self._shot_deps_vert_split
+        self._right_vert_split.addWidget(self._shot_deps_vert_split)
+
+        ilink_widget = QtWidgets.QWidget(self._right_vert_split)
+        ilink_layout = QtWidgets.QVBoxLayout(ilink_widget)
+        ilink_layout.setContentsMargins(0, 0, 0, 0)
+        ilink_layout.setSpacing(4)
+
+        linked_label = QtWidgets.QLabel("Linked components (ilink):", ilink_widget)
+        ilink_layout.addWidget(linked_label, 0)
+
+        self.linked_tree = QtWidgets.QTreeWidget(ilink_widget)
         # Columns:
         #   Asset, Version, Component, Component.ext, Available, Size, Locations, To transfer
         # (without Path, to avoid confusing user when multiple locations exist).
@@ -290,31 +413,43 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         self.linked_tree.setSortingEnabled(True)
         self.linked_tree.setRootIsDecorated(False)
         self.linked_tree.setAlternatingRowColors(True)
-        right_layout.addWidget(self.linked_tree, 1)
+        ilink_layout.addWidget(self.linked_tree, 1)
 
-        # Panel for managing linked component transfer:
-        # - transfer launch button (target location is selected automatically).
-        linked_btn_bar = QtWidgets.QHBoxLayout()
-        linked_btn_bar.addStretch(1)
+        self._ilink_widget = ilink_widget
+        self._right_vert_split.addWidget(ilink_widget)
+        self._right_vert_split.setChildrenCollapsible(True)  # type: ignore[attr-defined]
+        self._right_vert_split.setStretchFactor(0, 3)
+        self._right_vert_split.setStretchFactor(1, 2)
 
-        self.transfer_linked_btn = QtWidgets.QPushButton("Transfer to local", right_widget)
-        self.transfer_linked_btn.clicked.connect(self._on_transfer_linked_to_local_clicked)
-        linked_btn_bar.addWidget(self.transfer_linked_btn)
+        right_layout.addWidget(self._right_vert_split, 1)
 
-        # Informative label with selected target location name.
+        # Single transfer bar for both use_this_list (split mode) and ilink (collect-linked mode).
+        right_transfer_bar = QtWidgets.QHBoxLayout()
+        right_transfer_bar.addStretch(1)
+        self.transfer_to_local_btn = QtWidgets.QPushButton("Transfer to local", right_widget)
+        self.transfer_to_local_btn.clicked.connect(self._on_transfer_to_local_clicked)
+        right_transfer_bar.addWidget(self.transfer_to_local_btn)
         self.transfer_target_info_label = QtWidgets.QLabel("(target: n/a)", right_widget)
-        linked_btn_bar.addWidget(self.transfer_target_info_label)
-
-        right_layout.addLayout(linked_btn_bar)
+        right_transfer_bar.addWidget(self.transfer_target_info_label)
+        right_layout.addLayout(right_transfer_bar)
 
         splitter.addWidget(right_widget)
+
+        # Task mode: only shot links + use_this (ilink hidden until Collect linked succeeds).
+        self._set_right_pane_ilink_only(False)
 
         # So that all panes scale with the window and fill the frame (no empty stretch on the right).
         expanding = QtWidgets.QSizePolicy.Expanding  # type: ignore[attr-defined]
         preferred = QtWidgets.QSizePolicy.Preferred  # type: ignore[attr-defined]
         for w in (left_widget, middle_widget, right_widget):
             w.setSizePolicy(expanding, preferred)
-        for tree in (self.task_tree, self.files_tree, self.snapshots_tree, self.linked_tree):
+        for tree in (
+            self.task_tree,
+            self.files_tree,
+            self.snapshots_tree,
+            self.linked_tree,
+            self.use_this_tree,
+        ):
             tree.setSizePolicy(expanding, expanding)
 
         # Stretch: left gets a solid share so it scales; middle and right fill the rest.
@@ -364,6 +499,67 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
                 right = rest - mid
                 splitter.setSizes([left, mid, right])
                 self._splitter_initial_sizes_set = True
+
+        rvs = getattr(self, "_right_vert_split", None)
+        if (
+            rvs is not None
+            and not getattr(self, "_right_vert_split_sizes_set", True)
+            and rvs.height() > 80
+            and not getattr(self, "_right_pane_ilink_only", False)
+        ):
+            h = rvs.height()
+            iw = getattr(self, "_ilink_widget", None)
+            if iw is not None and not iw.isVisible():
+                rvs.setSizes([max(160, h), 0])
+            else:
+                rvs.setSizes([max(160, int(h * 0.55)), max(120, int(h * 0.45))])
+            self._right_vert_split_sizes_set = True
+
+        svs = getattr(self, "_shot_deps_vert_split", None)
+        if (
+            svs is not None
+            and not self._shot_deps_vert_split_sizes_set
+            and svs.height() > 120
+            and not getattr(self, "_right_pane_ilink_only", False)
+        ):
+            ih = svs.height()
+            # Upper: linked tasks; lower: metadata tree (user can drag the handle).
+            svs.setSizes([max(100, int(ih * 0.34)), max(140, int(ih * 0.66))])
+            self._shot_deps_vert_split_sizes_set = True
+
+    def _set_right_pane_ilink_only(self, ilink_only: bool) -> None:
+        """Toggle right pane: shot links + use_this only vs ilink only (after Collect linked)."""
+        self._right_pane_ilink_only = bool(ilink_only)
+        sdw = getattr(self, "_shot_deps_widget", None)
+        iw = getattr(self, "_ilink_widget", None)
+        rvs = getattr(self, "_right_vert_split", None)
+        if sdw is None or rvs is None:
+            return
+        if ilink_only:
+            sdw.hide()
+            if iw is not None:
+                iw.show()
+            rvs.setStretchFactor(0, 0)
+            rvs.setStretchFactor(1, 1)
+
+            def _resize_ilink_full() -> None:
+                h = max(rvs.height(), 120)
+                rvs.setSizes([0, h])
+
+            QtCore.QTimer.singleShot(0, _resize_ilink_full)
+        else:
+            if iw is not None:
+                iw.hide()
+            sdw.show()
+            rvs.setStretchFactor(0, 1)
+            rvs.setStretchFactor(1, 0)
+
+            def _resize_shot_only() -> None:
+                h = max(rvs.height(), 200)
+                # All vertical space to shot deps; ilink hidden (no third empty panel).
+                rvs.setSizes([h, 0])
+
+            QtCore.QTimer.singleShot(0, _resize_shot_only)
 
     def _build_board_page(self) -> None:
         """Create Board view page (tasks grouped by status) inside task view stack."""
@@ -649,6 +845,7 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         if not groups:
             self._apply_left_pane_sizing_for_view_mode(is_board=True)
             self._update_splitter_for_board()
+            self._schedule_board_splitter_refresh()
             return
 
         # Optional status filter for Board view (e.g. only "In progress").
@@ -696,9 +893,24 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
             self.board_layout.addWidget(column_widget)
             self._board_lists[status] = list_widget
 
-        # No stretch: board frame fits content width instead of filling the pane.
+        # Wide boards scroll inside the left pane QScrollArea; splitter share is capped.
         self._apply_left_pane_sizing_for_view_mode(is_board=True)
         self._update_splitter_for_board()
+        self._schedule_board_splitter_refresh()
+
+    def _schedule_board_splitter_refresh(self) -> None:
+        """Re-apply board splitter after the window has a real width (standalone launch)."""
+        if QtCore is None:
+            return
+
+        def _deferred() -> None:
+            if not hasattr(self, "view_mode_combo"):
+                return
+            if self.view_mode_combo.currentText() != "Board":
+                return
+            self._update_splitter_for_board()
+
+        QtCore.QTimer.singleShot(0, _deferred)
 
     # ------------------------------------------------------------------ Slots / helpers
 
@@ -722,15 +934,29 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         except Exception:
             return 1.25
 
-    def _apply_left_pane_sizing_for_view_mode(self, is_board: bool) -> None:
-        """Board mode: left pane fits content (fixed-width columns). Tree mode: left pane stretches."""
+    def _board_left_min_width(self) -> int:
+        """Minimum width for the Board left column (splitter + widget).
+
+        Using ``220 * devicePixelRatio`` as the floor makes 175% DPI (~385px) eat
+        small standalone windows; blend part of the scale so the pane stays readable
+        but leaves room for files / links columns.
+        """
+        scale = self._content_scale_factor()
+        blended = 1.0 + (scale - 1.0) * 0.45
+        return max(200, int(220 * blended))
+
+    def _apply_left_pane_sizing_for_view_mode(self, is_board: bool) -> Optional[int]:
+        """Board mode: record ideal board width; splitter caps share so center/right stay usable.
+
+        Tree mode: left pane stretches horizontally.
+        """
         left = getattr(self, "_left_pane_widget", None)
         if left is None:
-            return
+            return None
         expanding = QtWidgets.QSizePolicy.Expanding  # type: ignore[attr-defined]
         preferred = QtWidgets.QSizePolicy.Preferred  # type: ignore[attr-defined]
         if is_board:
-            # Fit to board content; use generous width so long names fit (e.g. at 175% DPI).
+            # Ideal width if all status columns were visible without horizontal scroll.
             scale = self._content_scale_factor()
             num_cols = len(getattr(self, "_board_lists", {}))
             if num_cols == 0:
@@ -740,30 +966,45 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
             board_col_spacing = int(12 * scale)
             board_extra = int(90 * scale)  # scrollbar, margins, list padding
             content_width = num_cols * board_col_width + (num_cols - 1) * board_col_spacing + board_extra
-            left.setMinimumWidth(content_width)
-            left.setMaximumWidth(content_width)
+            self._board_desired_left_width = content_width
+            # Do not lock min=max to content_width: narrow windows (e.g. standalone 900px)
+            # would leave the task list taking half the frame. Extra columns scroll inside
+            # the board QScrollArea.
+            left.setMinimumWidth(self._board_left_min_width())
+            left.setMaximumWidth(16777215)  # QWIDGETSIZE_MAX
             left.setSizePolicy(preferred, left.sizePolicy().verticalPolicy())
             return content_width
         else:
+            self._board_desired_left_width = None
             left.setMinimumWidth(max(220, int(220 * self._content_scale_factor())))
             left.setMaximumWidth(16777215)  # QWIDGETSIZE_MAX
             left.setSizePolicy(expanding, left.sizePolicy().verticalPolicy())
             return None
 
     def _update_splitter_for_board(self) -> None:
-        """Apply splitter sizes so the left pane gets its board content width (fix on Tree -> Board switch)."""
+        """Set main splitter so the board column gets min(desired width, capped fraction of window)."""
         left = getattr(self, "_left_pane_widget", None)
         splitter = getattr(self, "_main_splitter", None)
         if left is None or splitter is None or splitter.count() < 3:
             return
-        content_width = left.maximumWidth()
         total = splitter.width()
-        if total < content_width + 100:
+        if total < 280:
             return
-        rest = total - content_width
+        min_left = self._board_left_min_width()
+        desired = getattr(self, "_board_desired_left_width", None)
+        if desired is None:
+            desired = min_left
+        desired = max(min_left, int(desired))
+        # Cap board pane: ~30% of width (42% was still too wide at 125%+ DPI).
+        max_left_frac = max(min_left, int(total * 0.30))
+        left_w = min(desired, max_left_frac)
+        rest = total - left_w
+        if rest < 200:
+            left_w = max(min_left, total - 360)
+            rest = total - left_w
         mid = rest * 3 // 5
         right = rest - mid
-        splitter.setSizes([content_width, mid, right])
+        splitter.setSizes([left_w, mid, right])
 
     def _on_view_mode_changed(self, index: int) -> None:
         """Handle switching between Tree and Board views (dropdown)."""
@@ -853,6 +1094,8 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         self.files_tree.clear()
         self.snapshots_tree.clear()
         self.linked_tree.clear()
+        self._clear_shot_deps_ui()
+        self._set_right_pane_ilink_only(False)
 
         # By default task action buttons are disabled,
         # enable them only when a valid task is selected.
@@ -870,6 +1113,8 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         # If working root is configured and directory already exists, show files.
         if self._workdir_root:
             self._populate_task_files_for_data(task_data, create_if_missing=False)
+
+        self._load_shot_linked_tasks_for_selection(task_data)
 
     def _on_board_item_double_clicked(self, item: QtWidgets.QListWidgetItem) -> None:  # type: ignore[misc]
         """Handle double-click on task in Board view."""
@@ -927,7 +1172,7 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         t_tasks_query_start = time.perf_counter()
         base_query = (
             'select id, name, project.name, project.id, '
-            'parent.full_name, status.name, project.status.name, link '
+            'parent.id, parent.full_name, status.name, project.status.name, link '
             f'from Task where assignments.resource.username is "{self._api_user}"'
         )
         if project_id:
@@ -980,12 +1225,17 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
             if context_segments:
                 parent_full_name = ".".join([proj_name] + context_segments)
 
+            parent_entity = t.get("parent") or {}
+            parent_id_val = parent_entity.get("id")
+            parent_id_str = str(parent_id_val) if parent_id_val else None
+
             self._all_tasks.append(
                 {
                     "id": t["id"],
                     "name": t.get("name", ""),
                     "project_name": proj_name,
                     "project_id": proj_id,
+                    "parent_id": parent_id_str,
                     "parent_full_name": parent_full_name,
                     "context_segments": context_segments,
                     "status_name": status_name,
@@ -1181,6 +1431,7 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         """Load snapshot components (.hip) published from the given task."""
         self.snapshots_tree.clear()
         self.linked_tree.clear()
+        self._set_right_pane_ilink_only(False)
 
         if not self.session:
             return
@@ -1748,9 +1999,16 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
                 pass
         return best
 
-    def _update_transfer_target_label(self, location: Optional[Any]) -> None:
-        """Update label next to transfer button."""
-        if not hasattr(self, "transfer_target_info_label"):
+    def _update_transfer_target_label(
+        self,
+        location: Optional[Any],
+        label_widget: Optional[Any] = None,
+    ) -> None:
+        """Update label next to transfer button(s)."""
+        widget = label_widget
+        if widget is None:
+            widget = getattr(self, "transfer_target_info_label", None)
+        if widget is None:
             return
         if not location:
             text = "(target: n/a)"
@@ -1762,7 +2020,7 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
             if not name:
                 name = "<unknown>"
             text = f"(target: {name})"
-        self.transfer_target_info_label.setText(text)
+        widget.setText(text)
 
     def _get_component_locations_for_ids(self, component_ids: List[str]) -> Dict[str, List[Dict[str, str]]]:
         """Return for each component_id list of locations where it is present.
@@ -1932,6 +2190,7 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
     def _on_collect_linked_clicked(self) -> None:
         """Collect and display linked components (ilink) for selected snapshot."""
         self.linked_tree.clear()
+        self._set_right_pane_ilink_only(False)
 
         if not self.session:
             self._set_status("No active ftrack session; cannot collect linked components.")
@@ -2362,16 +2621,674 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
 
         if total == 0:
             self._set_status("No linked components resolved from ilink metadata.")
+            self._set_right_pane_ilink_only(False)
         else:
             self._set_status(f"Collected {total} linked component(s) from ilink.")
+            self._set_right_pane_ilink_only(True)
 
-    def _on_transfer_linked_to_local_clicked(self) -> None:
-        """Launch actual transfer for marked linked components.
+    # ------------------------------------------------------------------ Shot-linked tasks + use_this_list
 
-        Use same TransferWorker and TransferStatusDialog as main browser.
-        Target location is selected automatically as location with minimum priority.
+    def _clear_shot_deps_ui(self) -> None:
+        """Clear shot link list and use_this tree (no network)."""
+        if hasattr(self, "shot_links_list"):
+            self.shot_links_list.clear()
+        if hasattr(self, "use_this_tree"):
+            self.use_this_tree.clear()
+
+    @staticmethod
+    def _typed_context_type_name(other: Dict[str, Any]) -> str:
+        """Task type label from entity (type or object_type, depending on schema)."""
+        try:
+            t = (other.get("type") or {}).get("name") or ""
+        except Exception:
+            t = ""
+        if t:
+            return str(t)
+        try:
+            return str((other.get("object_type") or {}).get("name") or "")
+        except Exception:
+            return ""
+
+    def _query_task_parent_id(self, other_task_id: str) -> Optional[str]:
+        """Resolve Task.parent.id when link projection did not include parent."""
+        if not self.session or not other_task_id:
+            return None
+        try:
+            row = self.session.query(
+                f'select parent.id from Task where id is "{other_task_id}"'
+            ).first()
+        except Exception as exc:
+            logger.debug(
+                "UserTasksWidget: parent.id lookup for Task %s failed: %s",
+                other_task_id,
+                exc,
+            )
+            return None
+        if not row:
+            return None
+        par = row.get("parent") or {}
+        pid = par.get("id")
+        return str(pid) if pid else None
+
+    def _append_linked_task_rows(
+        self,
+        results: List[Dict[str, Any]],
+        seen: set[str],
+        task_id: str,
+        rows: Any,
+        direction: str,
+        field: str,
+        parent_id: str,
+        *,
+        filter_parent_in_python: bool,
+    ) -> None:
+        """Merge query rows into *results*; optionally keep only same Task.parent."""
+        for row in rows or []:
+            other = row.get(field) or {}
+            oid = other.get("id")
+            if not oid:
+                continue
+            if filter_parent_in_python:
+                opar = other.get("parent") or {}
+                opid = opar.get("id")
+                if opid is None:
+                    opid = self._query_task_parent_id(str(oid))
+                if opid is None:
+                    continue
+                if str(opid) != str(parent_id):
+                    continue
+            sid = str(oid)
+            if sid == str(task_id) or sid in seen:
+                continue
+            # ``type.name`` on Task is usually pipeline type (Animation, Layout), not "Task".
+            type_name = self._typed_context_type_name(other)
+            seen.add(sid)
+            results.append(
+                {
+                    "id": sid,
+                    "name": other.get("name") or sid,
+                    "type_name": type_name,
+                    "direction": direction,
+                }
+            )
+
+    def _fetch_same_parent_task_links(
+        self,
+        task_id: str,
+        parent_id: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """Linked tasks as on ftrack web Links tab (same shot parent).
+
+        Per ftrack Developer Hub "Using entity links":
+        TypedContext (including Task) has ``incoming_links`` and ``outgoing_links``;
+        each link has ``from`` and ``to``. For incoming links to this task,
+        ``link['to']`` is this task and ``link['from']`` is the linked context.
+        See: https://developer.ftrack.com/api-clients/examples/entity-links
         """
+        if not self.session or not task_id or not parent_id:
+            return []
 
+        tid = str(task_id)
+        pid = str(parent_id)
+        results: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+
+        # Try several projections: object_type in nested select breaks some servers.
+        query_variants = [
+            (
+                f"select id, "
+                f"incoming_links.from.id, incoming_links.from.name, "
+                f"incoming_links.from.type.name, incoming_links.from.parent.id, "
+                f"outgoing_links.to.id, outgoing_links.to.name, "
+                f"outgoing_links.to.type.name, outgoing_links.to.parent.id "
+                f'from Task where id is "{tid}"'
+            ),
+            (
+                f'select id, incoming_links, outgoing_links from Task where id is "{tid}"'
+            ),
+        ]
+
+        task: Any = None
+        for q_idx, q in enumerate(query_variants):
+            try:
+                task = self.session.query(q).first()
+            except Exception as exc:
+                logger.debug(
+                    "UserTasksWidget: Task links query variant %s failed: %s",
+                    q_idx,
+                    exc,
+                )
+                task = None
+                continue
+            if task is not None:
+                break
+
+        if task is None:
+            try:
+                task = self.session.get("Task", tid)
+            except Exception as exc:
+                logger.warning("UserTasksWidget: session.get(Task) failed: %s", exc)
+                return []
+
+        def _consume_links(links: Any, direction: str, other_key: str) -> None:
+            if not links:
+                return
+            try:
+                links = list(links)
+            except Exception:
+                pass
+            for link in links:
+                try:
+                    other = link.get(other_key) or {}
+                except Exception:
+                    continue
+                self._append_linked_task_rows(
+                    results,
+                    seen,
+                    tid,
+                    [{other_key: other}],
+                    direction,
+                    other_key,
+                    pid,
+                    filter_parent_in_python=True,
+                )
+
+        try:
+            _consume_links(task.get("incoming_links"), "incoming", "from")
+            _consume_links(task.get("outgoing_links"), "outgoing", "to")
+        except Exception as exc:
+            logger.warning(
+                "UserTasksWidget: reading Task incoming_links/outgoing_links failed: %s",
+                exc,
+            )
+
+        results.sort(key=lambda r: (r.get("name") or "").lower())
+        return results
+
+    def _load_shot_linked_tasks_for_selection(self, task_data: Dict[str, Any]) -> None:
+        """Populate shot-linked task list when user selects a task."""
+        self._clear_shot_deps_ui()
+        if not hasattr(self, "shot_links_list"):
+            return
+
+        task_id = str(task_data.get("id") or "").strip()
+        parent_id = task_data.get("parent_id")
+        if not task_id:
+            return
+
+        if not parent_id:
+            tip = QtWidgets.QListWidgetItem(
+                "(Selected task has no Task.parent id; cannot filter same-shot links.)"
+            )
+            tip.setFlags(QtCore.Qt.NoItemFlags)  # type: ignore[attr-defined]
+            self.shot_links_list.addItem(tip)
+            self._set_status("Task has no parent id; shot links need parent context.")
+            return
+
+        self._set_status("Loading shot-level linked tasks...")
+        rows = self._fetch_same_parent_task_links(task_id, str(parent_id))
+
+        if not rows:
+            self._set_status(
+                "No linked tasks with the same parent (web Links / incoming_links & outgoing_links)."
+            )
+            return
+
+        shot_ctx = task_data.get("parent_full_name") or task_data.get("project_name") or ""
+        scale = self._content_scale_factor()
+        row_h = max(40, int(40 * scale))
+
+        for row in rows:
+            name = row.get("name") or row["id"]
+            type_name = (row.get("type_name") or "").strip()
+            direction = (row.get("direction") or "").strip()
+            line2: List[str] = []
+            if shot_ctx:
+                line2.append(shot_ctx)
+            if type_name:
+                line2.append(type_name)
+            if direction:
+                line2.append(direction.capitalize())
+            text = f"{name}\n{' · '.join(line2)}" if line2 else name
+            lw = QtWidgets.QListWidgetItem(text)
+            lw.setData(QtCore.Qt.UserRole, row)  # type: ignore[attr-defined]
+            try:
+                lw.setSizeHint(QtCore.QSize(0, row_h))  # type: ignore[attr-defined,call-arg]
+            except Exception:
+                pass
+            self.shot_links_list.addItem(lw)
+
+        self._set_status(f"{len(rows)} shot-linked task(s). Select one for use_this_list.")
+
+    def _on_shot_link_selection_changed(self) -> None:
+        """Load use_this_list for the linked task selected in shot_links_list."""
+        if not hasattr(self, "use_this_tree") or not hasattr(self, "shot_links_list"):
+            return
+        items = self.shot_links_list.selectedItems()
+        if not items:
+            self.use_this_tree.clear()
+            return
+        data = items[0].data(QtCore.Qt.UserRole)  # type: ignore[attr-defined]
+        if not isinstance(data, dict) or not data.get("id"):
+            return
+        self._load_use_this_for_linked_task(str(data["id"]))
+
+    def _query_assets_for_linked_task(self, linked_task_id: str) -> List[Any]:
+        """Resolve Assets for a task for ``use_this_list`` (stored on Asset.metadata).
+
+        ftrack links tasks to publish data via ``AssetVersion.task``; the parent of a
+        version is the ``Asset``. Query versions for the task, collect distinct
+        ``asset`` dicts, then read ``use_this_list`` from ``Asset.metadata``.
+        """
+        if not self.session:
+            return []
+        tid = str(linked_task_id).strip()
+        if not tid:
+            return []
+
+        seen: set[str] = set()
+        assets: List[Any] = []
+
+        def _add_asset_entity(a: Any) -> None:
+            if not isinstance(a, dict):
+                return
+            aid = a.get("id")
+            if not aid:
+                return
+            sid = str(aid)
+            if sid in seen:
+                return
+            seen.add(sid)
+            assets.append(a)
+
+        try:
+            versions = self.session.query(
+                f'select asset.id, asset.name, asset.metadata '
+                f'from AssetVersion where task.id is "{tid}"'
+            ).all()
+        except Exception as exc:
+            logger.warning(
+                "UserTasksWidget: AssetVersion query for task %s failed: %s",
+                tid,
+                exc,
+            )
+            versions = []
+
+        for v in versions or []:
+            _add_asset_entity(v.get("asset") or {})
+
+        return assets
+
+    def _parse_asset_metadata_keyed_component_blob(self, raw: Any) -> Dict[str, str]:
+        """Parse ``use_this_list`` / ``latest_published_list`` value: JSON or dict, key -> component id."""
+        if raw is None:
+            return {}
+        try:
+            if isinstance(raw, str):
+                use_map = json.loads(raw)
+            elif isinstance(raw, dict):
+                use_map = dict(raw)
+            else:
+                return {}
+        except Exception:
+            return {}
+        if not isinstance(use_map, dict):
+            return {}
+        use_map.pop("status_note", None)
+        clean: Dict[str, str] = {}
+        for k, v in use_map.items():
+            ks = str(k).strip()
+            vs = str(v).strip()
+            if ks and vs:
+                clean[ks] = vs
+        return clean
+
+    def _metadata_flat_component_pairs(self, meta: Mapping[str, Any]) -> Dict[str, str]:
+        """Flat Asset.metadata entries ``key -> component_id`` (transitional, no list blobs).
+
+        Skips structured keys (``use_this_list``, etc.). Numeric keys (``\"0\"``, ``\"1\"``)
+        accept any non-empty value, matching legacy ilink-style metadata.
+        """
+        out: Dict[str, str] = {}
+        for k, v in meta.items():
+            ks = str(k).strip()
+            if not ks or ks.lower() in _ASSET_METADATA_NON_PAIR_KEYS:
+                continue
+            if v is None:
+                continue
+            if isinstance(v, (dict, list, bytes)):
+                continue
+            vs = str(v).strip()
+            if not vs:
+                continue
+            if ks.isdigit():
+                out[ks] = vs
+                continue
+            if _looks_like_ftrack_entity_id(vs):
+                out[ks] = vs
+        return out
+
+    def _build_component_map_from_asset_metadata(self, meta: Mapping[str, Any]) -> Dict[str, str]:
+        """Merge ``use_this_list``, ``latest_published_list``, and flat metadata pairs.
+
+        ``use_this_list`` wins over ``latest_published_list`` on the same key; flat pairs
+        only add keys not already set from either list blob.
+        """
+        combined: Dict[str, str] = {}
+        combined.update(self._parse_asset_metadata_keyed_component_blob(meta.get("use_this_list")))
+        for k, v in self._parse_asset_metadata_keyed_component_blob(
+            meta.get("latest_published_list")
+        ).items():
+            if k not in combined:
+                combined[k] = v
+        for k, v in self._metadata_flat_component_pairs(meta).items():
+            if k not in combined:
+                combined[k] = v
+        return combined
+
+    def _load_use_this_for_linked_task(self, linked_task_id: str) -> None:
+        """Show Assets on linked task and component ids from metadata (lists + flat pairs)."""
+        if not self.session or not hasattr(self, "use_this_tree"):
+            return
+
+        self._use_this_tree_syncing = True
+        self.use_this_tree.blockSignals(True)
+        self.use_this_tree.clear()
+        self.use_this_tree.blockSignals(False)
+        self._use_this_tree_syncing = False
+
+        locations = self._get_accessible_locations()
+        by_location_id: Dict[str, Any] = {}
+        for loc in locations:
+            lid = loc.get("id")
+            if lid:
+                by_location_id[str(lid)] = loc
+
+        target_location = self._pick_default_target_location(locations)
+        self._update_transfer_target_label(target_location)
+        target_loc_id: Optional[str] = None
+        if target_location is not None:
+            try:
+                tlid = target_location.get("id")
+                if tlid:
+                    target_loc_id = str(tlid)
+            except Exception:
+                target_loc_id = None
+
+        accessible_location_ids = {str(loc.get("id")) for loc in locations if loc.get("id")}
+
+        assets = self._query_assets_for_linked_task(linked_task_id)
+        if not assets:
+            self._set_status(
+                "No assets for this task (no AssetVersions linked to this task)."
+            )
+            return
+
+        comp_ids_flat: List[str] = []
+        per_asset: List[tuple[Any, Dict[str, str]]] = []
+
+        for asset_entity in assets or []:
+            meta = asset_entity.get("metadata") or {}
+            if not isinstance(meta, Mapping):
+                meta = {}
+            clean = self._build_component_map_from_asset_metadata(meta)
+            for _k, cid in clean.items():
+                comp_ids_flat.append(cid)
+            per_asset.append((asset_entity, clean))
+
+        comp_locations_map: Dict[str, List[Dict[str, str]]] = {}
+        if comp_ids_flat:
+            comp_locations_map = self._get_component_locations_for_ids(comp_ids_flat)
+            filtered_clm: Dict[str, List[Dict[str, str]]] = {}
+            for comp_id, loc_list in comp_locations_map.items():
+                filtered_locs = [
+                    loc_entry
+                    for loc_entry in loc_list
+                    if str(loc_entry.get("id", "")) in accessible_location_ids
+                ]
+                if filtered_locs:
+                    filtered_clm[comp_id] = filtered_locs
+            comp_locations_map = filtered_clm
+
+        total_rows = 0
+        self._use_this_tree_syncing = True
+        self.use_this_tree.setSortingEnabled(False)
+        try:
+            for asset_entity, use_map in per_asset:
+                aid = str(asset_entity.get("id") or "")
+                aname = asset_entity.get("name") or aid or "<asset>"
+                asset_item = QtWidgets.QTreeWidgetItem([aname, aid, "", "", ""])
+                asset_item.setData(
+                    0,
+                    QtCore.Qt.UserRole,
+                    {"role": "asset", "asset_id": aid},
+                )  # type: ignore[attr-defined]
+                af = asset_item.flags()
+                af |= QtCore.Qt.ItemIsUserCheckable  # type: ignore[attr-defined]
+                asset_item.setFlags(af)
+                asset_item.setCheckState(4, QtCore.Qt.Unchecked)  # type: ignore[attr-defined]
+
+                if not use_map:
+                    empty = QtWidgets.QTreeWidgetItem(
+                        ["(no component keys in metadata)", "", "-", "-", ""]
+                    )
+                    empty.setFlags(QtCore.Qt.ItemIsEnabled)  # type: ignore[attr-defined]
+                    asset_item.addChild(empty)
+                    self.use_this_tree.addTopLevelItem(asset_item)
+                    continue
+
+                for comp_key, cid in sorted(use_map.items(), key=lambda kv: kv[0].lower()):
+                    self._append_use_this_component_row(
+                        asset_item,
+                        comp_key,
+                        cid,
+                        by_location_id,
+                        comp_locations_map,
+                        target_loc_id,
+                        accessible_location_ids,
+                    )
+                    total_rows += 1
+
+                any_checkable = False
+                for j in range(asset_item.childCount()):
+                    ch = asset_item.child(j)
+                    if ch.flags() & QtCore.Qt.ItemIsUserCheckable:  # type: ignore[attr-defined]
+                        any_checkable = True
+                        break
+                if not any_checkable:
+                    af_plain = asset_item.flags()
+                    af_plain &= ~QtCore.Qt.ItemIsUserCheckable  # type: ignore[attr-defined]
+                    asset_item.setFlags(af_plain)
+
+                self.use_this_tree.addTopLevelItem(asset_item)
+                asset_item.setExpanded(True)
+
+        finally:
+            self.use_this_tree.setSortingEnabled(True)
+            self._use_this_tree_syncing = False
+
+        if total_rows == 0:
+            self._set_status(
+                "Linked task has Assets but no component ids "
+                "(use_this_list / latest_published_list / flat metadata pairs)."
+            )
+        else:
+            self._set_status(
+                f"Asset metadata: {total_rows} component row(s) "
+                "(lists + pairs). Use asset row checkbox to select all transferable in that asset."
+            )
+
+    def _append_use_this_component_row(
+        self,
+        asset_item: QtWidgets.QTreeWidgetItem,  # type: ignore[name-defined]
+        comp_key: str,
+        component_id: str,
+        by_location_id: Dict[str, Any],
+        comp_locations_map: Dict[str, List[Dict[str, str]]],
+        target_loc_id: Optional[str],
+        accessible_location_ids: set[str],
+    ) -> None:
+        """Add child row under *asset_item* for one use_this_list component."""
+        loc_entries = comp_locations_map.get(str(component_id), [])
+
+        try:
+            locations_str = ", ".join(
+                sorted(
+                    {entry["name"] for entry in loc_entries if entry.get("name")},
+                    key=lambda n: n.lower(),
+                )
+            )
+        except Exception:
+            locations_str = ""
+        if not locations_str:
+            locations_str = "-"
+
+        available = "No"
+
+        linked_comp = None
+        try:
+            linked_comp = self.session.get("Component", str(component_id))
+        except Exception as exc:
+            logger.debug("UserTasksWidget: get Component %s: %s", component_id, exc)
+
+        if linked_comp:
+            for entry in loc_entries:
+                lid = entry.get("id")
+                if not lid:
+                    continue
+                loc = by_location_id.get(str(lid))
+                if not loc:
+                    continue
+                try:
+                    p = loc.get_filesystem_path(linked_comp)
+                    if p is None:
+                        continue
+                    path = str(p)
+                    if os.path.exists(path):
+                        available = "Yes"
+                    else:
+                        available = "No"
+                    break
+                except Exception:
+                    continue
+
+        already_in_target = False
+        if target_loc_id is not None:
+            try:
+                already_in_target = any(
+                    str(entry.get("id")) == target_loc_id for entry in loc_entries
+                )
+            except Exception:
+                already_in_target = False
+
+        has_accessible_source = False
+        if not already_in_target:
+            for entry in loc_entries:
+                lid = entry.get("id")
+                if lid and str(lid) != target_loc_id and str(lid) in accessible_location_ids:
+                    has_accessible_source = True
+                    break
+
+        child = QtWidgets.QTreeWidgetItem(
+            [
+                comp_key,
+                str(component_id),
+                available,
+                locations_str,
+                "",
+            ]
+        )
+        child.setData(
+            0,
+            QtCore.Qt.UserRole,
+            {"role": "component", "component_id": str(component_id)},
+        )  # type: ignore[attr-defined]
+        cf = child.flags()
+        cf |= QtCore.Qt.ItemIsUserCheckable  # type: ignore[attr-defined]
+        child.setFlags(cf)
+
+        if already_in_target or not has_accessible_source:
+            cf2 = child.flags()
+            cf2 &= ~QtCore.Qt.ItemIsUserCheckable  # type: ignore[attr-defined]
+            child.setFlags(cf2)
+        else:
+            default_state = (
+                QtCore.Qt.Checked
+                if available != "Yes"
+                else QtCore.Qt.Unchecked
+            )  # type: ignore[attr-defined]
+            child.setCheckState(4, default_state)
+
+    def _on_use_this_tree_item_changed(
+        self,
+        item: QtWidgets.QTreeWidgetItem,  # type: ignore[name-defined]
+        column: int,
+    ) -> None:
+        """When asset row Transfer column toggles, sync checkable children."""
+        if self._use_this_tree_syncing or column != 4:
+            return
+        if not hasattr(self, "use_this_tree"):
+            return
+
+        meta = item.data(0, QtCore.Qt.UserRole)  # type: ignore[attr-defined]
+        if not isinstance(meta, dict) or meta.get("role") != "asset":
+            return
+        if not (item.flags() & QtCore.Qt.ItemIsUserCheckable):  # type: ignore[attr-defined]
+            return
+
+        state = item.checkState(4)
+        self._use_this_tree_syncing = True
+        try:
+            for i in range(item.childCount()):
+                ch = item.child(i)
+                if ch.flags() & QtCore.Qt.ItemIsUserCheckable:  # type: ignore[attr-defined]
+                    ch.setCheckState(4, state)
+        finally:
+            self._use_this_tree_syncing = False
+
+    def _on_select_all_use_this_clicked(self) -> None:
+        """Check Transfer for components that are not available locally but can transfer."""
+        if not hasattr(self, "use_this_tree"):
+            return
+        root = self.use_this_tree.invisibleRootItem()
+        self._use_this_tree_syncing = True
+        try:
+            for i in range(root.childCount()):
+                parent_it = root.child(i)
+                for j in range(parent_it.childCount()):
+                    ch = parent_it.child(j)
+                    if not (ch.flags() & QtCore.Qt.ItemIsUserCheckable):  # type: ignore[attr-defined]
+                        continue
+                    if ch.text(2) != "Yes":
+                        ch.setCheckState(4, QtCore.Qt.Checked)  # type: ignore[attr-defined]
+        finally:
+            self._use_this_tree_syncing = False
+
+    def _collect_checked_use_this_component_ids(self) -> List[str]:
+        """Checked component rows under use_this_tree (column 4)."""
+        ids: List[str] = []
+        if not hasattr(self, "use_this_tree"):
+            return ids
+        root = self.use_this_tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            parent_it = root.child(i)
+            for j in range(parent_it.childCount()):
+                ch = parent_it.child(j)
+                if ch.checkState(4) != QtCore.Qt.Checked:  # type: ignore[attr-defined]
+                    continue
+                if not (ch.flags() & QtCore.Qt.ItemIsUserCheckable):  # type: ignore[attr-defined]
+                    continue
+                meta = ch.data(0, QtCore.Qt.UserRole)  # type: ignore[attr-defined]
+                if isinstance(meta, dict) and meta.get("component_id"):
+                    ids.append(str(meta["component_id"]))
+                else:
+                    txt = ch.text(1).strip()
+                    if txt:
+                        ids.append(txt)
+        return ids
+
+    def _collect_checked_linked_tree_component_ids(self) -> List[str]:
+        """Return component ids for rows checked in linked_tree (column 7)."""
         selected_ids: List[str] = []
         root_count = self.linked_tree.topLevelItemCount()
         for i in range(root_count):
@@ -2381,10 +3298,16 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
                 comp_id = item.data(0, QtCore.Qt.UserRole)
                 if comp_id:
                     selected_ids.append(str(comp_id))
+        return selected_ids
 
-        logger.info("UserTasksWidget: Transfer to local requested for linked components: %r", selected_ids)
+    def _start_transfer_jobs_for_component_ids(
+        self,
+        selected_ids: List[str],
+        result_label_word: str = "component",
+    ) -> None:
+        """Run TransferWorker batches for the given component ids (ilink + use_this_list)."""
         if not selected_ids:
-            self._set_status("No linked components selected for transfer.")
+            self._set_status("No components selected for transfer.")
             return
 
         if not self.session:
@@ -2429,12 +3352,6 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         self._update_transfer_target_label(to_location)
 
         # ---------- Determine where we can actually pull each component from ----------
-        # Build set of "best" sources for each selected component:
-        # - if component is already in target location and nowhere else -- skip;
-        # - if present both in target and other locations -- take non-target as source;
-        # - if not in any location -- skip;
-        # - from all possible sources prefer s3.minio, then backup, then others.
-
         # Map component_id -> list of locations where it is present
         comp_locations_map = self._get_component_locations_for_ids(selected_ids)
         
@@ -2553,7 +3470,7 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
 
         if not batches:
             self._set_status(
-                "No linked components can be transferred: all either missing in source locations or already in target."
+                "No components can be transferred: all either missing in source locations or already in target."
             )
             logger.info(
                 "UserTasksWidget: no transferable components. skipped_missing_source=%r, skipped_only_in_target=%r",
@@ -2649,8 +3566,25 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
                 pass
 
         self._set_status(
-            f"Initiated transfer for {total_planned} linked component(s) to {to_location_name}."
+            f"Initiated transfer for {total_planned} {result_label_word}(s) to {to_location_name}."
         )
+
+    def _on_transfer_to_local_clicked(self) -> None:
+        """Transfer checked components: ilink list after Collect linked, else use_this_list."""
+        if getattr(self, "_right_pane_ilink_only", False):
+            selected_ids = self._collect_checked_linked_tree_component_ids()
+            logger.info("UserTasksWidget: Transfer to local (ilink): %r", selected_ids)
+            self._start_transfer_jobs_for_component_ids(
+                selected_ids,
+                result_label_word="linked component",
+            )
+        else:
+            selected_ids = self._collect_checked_use_this_component_ids()
+            logger.info("UserTasksWidget: Transfer to local (use_this_list): %r", selected_ids)
+            self._start_transfer_jobs_for_component_ids(
+                selected_ids,
+                result_label_word="use_this component",
+            )
 
     # ------------------------------------------------------------------ File selection / open scene
 
