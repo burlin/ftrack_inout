@@ -61,6 +61,12 @@ class ComponentData:
     @classmethod
     def from_dict(cls, data: dict) -> 'ComponentData':
         """Create from dictionary."""
+        fr = data.get('frame_range')
+        if fr is not None and isinstance(fr, (list, tuple)) and len(fr) == 2:
+            try:
+                fr = (int(fr[0]), int(fr[1]))
+            except (TypeError, ValueError):
+                fr = data.get('frame_range')
         return cls(
             name=data.get('name', ''),
             file_path=data.get('file_path'),
@@ -68,7 +74,7 @@ class ComponentData:
             export_enabled=data.get('export_enabled', True),
             metadata=data.get('metadata', {}),
             sequence_pattern=data.get('sequence_pattern'),
-            frame_range=data.get('frame_range'),
+            frame_range=fr,
             transfer_after_publish=data.get('transfer_after_publish', True),
         )
 
@@ -626,17 +632,56 @@ class Publisher:
                     _log.warning(f"[Publisher] Thumbnail file not found, skipping: {thumb_path}")
             
             # ---------------------------------------------------------------
-            # 5. Update Asset Metadata Index
+            # 5. Update asset metadata list for latest published components
             # ---------------------------------------------------------------
-            _log.info("[Publisher] Updating asset metadata index...")
+            _log.info("[Publisher] Updating asset metadata latest_published_list...")
             try:
+                latest_published_key = "latest_published_list"
                 asset_meta = asset.get('metadata') or {}
                 if not isinstance(asset_meta, dict):
                     try:
                         asset_meta = dict(asset_meta)
                     except Exception:
                         asset_meta = {}
-                
+
+                # Keep a JSON map: {"component.ext": "<component_id>", ...}
+                # under one dedicated metadata key instead of flat root pairs.
+                try:
+                    latest_published_raw = asset_meta.get(latest_published_key)
+                    latest_published_list = (
+                        json.loads(latest_published_raw)
+                        if latest_published_raw
+                        else {}
+                    )
+                    if not isinstance(latest_published_list, dict):
+                        latest_published_list = {}
+                except Exception:
+                    latest_published_list = {}
+
+                # Backward-compatible migration:
+                # merge legacy flat key/value component pairs into latest_published_list.
+                reserved_keys = {
+                    latest_published_key,
+                    "use_this_list",
+                    "status_note",
+                }
+                migrated_legacy = []
+                legacy_keys_to_remove = []
+                for meta_key, meta_value in asset_meta.items():
+                    if meta_key in reserved_keys:
+                        continue
+                    if not isinstance(meta_key, str) or not meta_key:
+                        continue
+                    if not isinstance(meta_value, str) or not meta_value:
+                        continue
+                    # Legacy format stored component mapping directly in root metadata.
+                    # Keep migration permissive to convert existing assets gradually.
+                    if meta_key not in latest_published_list:
+                        latest_published_list[meta_key] = meta_value
+                        migrated_legacy.append(meta_key)
+                    legacy_keys_to_remove.append(meta_key)
+
+                updated_keys = []
                 for comp_entity in created_components:
                     try:
                         comp_name = comp_entity.get('name', '') or ''
@@ -645,15 +690,42 @@ class Publisher:
                         key = f"{comp_name}.{ext}" if (comp_name and ext) else comp_name or ''
                         comp_id = comp_entity.get('id')
                         if key and comp_id:
-                            asset_meta[key] = comp_id
-                            _log.debug(f"[Publisher] Asset metadata: {key} = {comp_id}")
+                            latest_published_list[key] = comp_id
+                            updated_keys.append(key)
+                            _log.debug(
+                                "[Publisher] latest_published_list: %s = %s",
+                                key,
+                                comp_id
+                            )
                     except Exception as _e:
                         _log.warning(f"[Publisher] Failed to update asset metadata for component: {_e}")
-                
+
+                # Remove legacy flat pairs from root metadata after migration.
+                for legacy_key in legacy_keys_to_remove:
+                    asset_meta.pop(legacy_key, None)
+
+                asset_meta[latest_published_key] = json.dumps(latest_published_list)
                 asset['metadata'] = asset_meta
-                _log.info(f"[Publisher] Updated asset metadata: {len(created_components)} components indexed")
+                if migrated_legacy:
+                    _log.info(
+                        "[Publisher] Migrated %d legacy metadata pair(s) into %s: %s",
+                        len(migrated_legacy),
+                        latest_published_key,
+                        migrated_legacy
+                    )
+                if legacy_keys_to_remove:
+                    _log.info(
+                        "[Publisher] Removed %d legacy flat metadata key(s) from asset root",
+                        len(legacy_keys_to_remove)
+                    )
+                _log.info(
+                    "[Publisher] Updated %s with %d component(s): %s",
+                    latest_published_key,
+                    len(updated_keys),
+                    updated_keys
+                )
             except Exception as _e:
-                _log.warning(f"[Publisher] Failed to update asset metadata index: {_e}")
+                _log.warning(f"[Publisher] Failed to update latest_published_list metadata: {_e}")
             
             # ---------------------------------------------------------------
             # 6. Final Commit
@@ -696,6 +768,8 @@ class Publisher:
             # 8. Transfer after publish (optional, per-component)
             # ---------------------------------------------------------------
             transfer_target = getattr(job, 'transfer_target_location', None) or None
+            if transfer_target in ('0', 0):
+                transfer_target = None
             if transfer_target:
                 _log.info(
                     "[Publisher] transfer_target_location in job: len=%d repr=%s",
