@@ -11,6 +11,11 @@ It is designed to be used both:
 - from ftrack Connect actions (Houdini, etc.), where environment is already prepared;
 - from external wrappers (e.g. tools/run_user_tasks.py) that only handle
   environment bootstrap and then call this module.
+
+UI features (implemented in ``UserTasksWidget``) include shot-level linked tasks
+(same as ftrack web Links via ``Task.incoming_links`` / ``outgoing_links`` per
+Developer Hub), ``use_this_list`` per linked task, and transfer-to-local for
+selected components.
 """
 
 import sys
