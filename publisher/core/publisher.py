@@ -439,7 +439,8 @@ class Publisher:
         
         _log.info("[Publisher] Starting real publish...")
         session = self.session
-        
+        session.reset()  # Clear any stale dirty state from a previous failed publish
+
         try:
             # ---------------------------------------------------------------
             # 1. Get Task (use session.get for cache)
