@@ -21,6 +21,8 @@ import logging
 import os
 import os.path
 
+from ....maya_workdir import get_maya_workdir
+
 try:  # pragma: no cover - depends on DCC environment
     import maya.cmds as cmds  # type: ignore
     MAYA_AVAILABLE: bool = True
@@ -290,7 +292,7 @@ class MayaUserTasksHandlers:
                     exc,
                 )
 
-        workdir = os.environ.get("FTRACK_WORKDIR", "")
+        workdir = get_maya_workdir() or ""
 
         scene_setup = {
             "task_id": task_id,

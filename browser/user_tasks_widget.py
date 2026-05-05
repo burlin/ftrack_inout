@@ -31,6 +31,7 @@ except Exception:  # pragma: no cover - for environments without Qt
     QtGui = None  # type: ignore
 
 from .simple_api_client import SimpleFtrackApiClient  # type: ignore
+from ..maya_workdir import get_maya_workdir, set_maya_workdir
 
 
 logger = logging.getLogger(__name__)
@@ -128,7 +129,13 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         ) or os.environ.get("FTRACK_CONTEXTID") or None
         # Root of project working directory, used for building paths
         # to scenes for tasks.
-        self._workdir_root = os.environ.get("FTRACK_WORKDIR") or None
+        # Maya: uses persisted MAYA_WORKDIR setting (env-independent because
+        # ftrack-connect wipes FTRACK_WORKDIR on Maya launch).
+        # Other DCCs: keep using FTRACK_WORKDIR.
+        if self._is_maya_context():
+            self._workdir_root = get_maya_workdir()
+        else:
+            self._workdir_root = os.environ.get("FTRACK_WORKDIR") or None
         self._settings = QtCore.QSettings("mroya", "TaskHubUserTasks") if QtCore is not None else None  # type: ignore[call-arg]
         # DCC handlers (Houdini/Blender/Maya) for actions like scene creation.
         self._dcc_handlers: Optional[UserTasksDccHandlers] = dcc_handlers
@@ -190,6 +197,24 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
 
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
+
+        # Maya-only: workdir row, with persisted MAYA_WORKDIR setting.
+        if self._is_maya_context():
+            workdir_row = QtWidgets.QHBoxLayout()
+            workdir_row.addWidget(QtWidgets.QLabel("Maya Workdir:", self))
+            self._workdir_label = QtWidgets.QLabel(
+                self._workdir_root or "(not set)", self
+            )
+            self._workdir_label.setStyleSheet("color: #888;")
+            workdir_row.addWidget(self._workdir_label, 1)
+            set_workdir_btn = QtWidgets.QPushButton("Set…", self)
+            set_workdir_btn.setToolTip(
+                "Choose the local working directory for task scenes.\n"
+                "Persists across sessions; replaces FTRACK_WORKDIR in Maya."
+            )
+            set_workdir_btn.clicked.connect(self._on_set_maya_workdir_clicked)
+            workdir_row.addWidget(set_workdir_btn)
+            layout.addLayout(workdir_row)
 
         # Main splitter: left = tasks (Tree / Board) + actions,
         # middle = files/snapshots, right = linked components.
@@ -1594,6 +1619,32 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         except Exception:
             return False
 
+    def _workdir_var_name(self) -> str:
+        """User-facing name of the active workdir setting."""
+        return "MAYA_WORKDIR" if self._is_maya_context() else "FTRACK_WORKDIR"
+
+    def _on_set_maya_workdir_clicked(self) -> None:
+        """Pick a directory and persist as MAYA_WORKDIR (Maya-only button)."""
+        start = self._workdir_root or ""
+        new_dir = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select Maya Working Directory", start
+        )
+        if not new_dir:
+            return
+        if not set_maya_workdir(new_dir):
+            self._set_status("Failed to persist MAYA_WORKDIR (Qt unavailable).")
+            return
+        self._workdir_root = new_dir
+        if hasattr(self, "_workdir_label"):
+            self._workdir_label.setText(new_dir)
+        self._set_status(f"MAYA_WORKDIR set to: {new_dir}")
+        # Refresh the currently selected task's file list, if any.
+        item = self.task_tree.currentItem()
+        if item is not None:
+            data = item.data(0, QtCore.Qt.UserRole)  # type: ignore[attr-defined]
+            if isinstance(data, dict):
+                self._populate_task_files_for_data(data, create_if_missing=False)
+
     def _build_task_directory(self, task_data: Dict[str, Any]) -> Optional[Path]:
         """Build path to task directory relative to FTRACK_WORKDIR.
 
@@ -1643,7 +1694,7 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
 
         dir_path = self._build_task_directory(task_data)
         if dir_path is None:
-            self._set_status("FTRACK_WORKDIR is not set; cannot build task directory.")
+            self._set_status(f"{self._workdir_var_name()} is not set; cannot build task directory.")
             return
 
         if not dir_path.exists():
@@ -1691,7 +1742,7 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
     def _on_create_task_scene_clicked(self) -> None:
         """Create recommended scene path for selected task and show its directory."""
         if not self._workdir_root:
-            self._set_status("FTRACK_WORKDIR is not set; cannot create task scene path.")
+            self._set_status(f"{self._workdir_var_name()} is not set; cannot create task scene path.")
             return
 
         current_item = self.task_tree.currentItem()
@@ -1764,7 +1815,7 @@ class UserTasksWidget(QtWidgets.QWidget):  # type: ignore[misc]
         warning.
         """
         if not self._workdir_root:
-            self._set_status("FTRACK_WORKDIR is not set; cannot copy snapshot to local.")
+            self._set_status(f"{self._workdir_var_name()} is not set; cannot copy snapshot to local.")
             return
 
         task_item = self.task_tree.currentItem()
